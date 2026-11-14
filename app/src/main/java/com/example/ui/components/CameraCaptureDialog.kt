@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledIconButton
@@ -106,7 +105,7 @@ fun CameraCaptureDialog(
                     verticalArrangement = Arrangement.Center
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.CameraAlt,
+                        imageVector = LocalMindIcons.CameraAlt,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.secondary,
                         modifier = Modifier.size(56.dp)
@@ -249,7 +248,7 @@ fun CameraCaptureDialog(
                             .testTag("capture_shutter_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.CameraAlt,
+                            imageVector = LocalMindIcons.CameraAlt,
                             contentDescription = stringResource(R.string.capture_photo),
                             modifier = Modifier.size(30.dp)
                         )

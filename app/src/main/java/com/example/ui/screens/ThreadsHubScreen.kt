@@ -1,12 +1,15 @@
 package com.example.ui.screens
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -30,6 +33,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -37,19 +43,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.Archive
-import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.CreateNewFolder
-import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Edit
-import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Home
-import androidx.compose.material.icons.rounded.MoreHoriz
-import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material.icons.rounded.Search
-import androidx.compose.material.icons.rounded.Storage
-import androidx.compose.material.icons.rounded.Unarchive
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
@@ -68,6 +65,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -76,19 +74,26 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.local.ChatThreadEntity
 import com.example.data.local.WorkspaceEntity
 import com.example.ui.components.FloatingCircleButton
+import com.example.ui.components.LocalMindIcons
+import com.example.ui.components.SegmentedPillSwitcher
 import com.example.ui.theme.LocalSemanticColors
+import com.example.ui.theme.MotionTokens
 import com.example.ui.theme.pressScale
 import com.example.ui.theme.rememberPrefersReducedMotion
 import com.example.ui.theme.tabular
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -119,8 +124,12 @@ fun ThreadsHubScreen(
 ) {
     val semantic = LocalSemanticColors.current
     val reducedMotion = rememberPrefersReducedMotion()
+    val haptics = LocalHapticFeedback.current
+    val coroutineScope = rememberCoroutineScope()
+    val pagerState = rememberPagerState(initialPage = HubTab.THREADS.ordinal) { HubTab.entries.size }
+    val threadsListState = rememberLazyListState()
+    val workspacesListState = rememberLazyListState()
 
-    var selectedTab by rememberSaveable { mutableStateOf(HubTab.THREADS) }
     var showArchived by rememberSaveable { mutableStateOf(false) }
     var searchOpen by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
@@ -233,315 +242,426 @@ fun ThreadsHubScreen(
             .background(MaterialTheme.colorScheme.background)
             .imePadding()
     ) {
-        LazyColumn(
+        HorizontalPager(
+            state = pagerState,
+            beyondViewportPageCount = 1,
             modifier = Modifier
                 .widthIn(max = 720.dp)
                 .align(Alignment.TopCenter)
-                .fillMaxSize(),
-            contentPadding = PaddingValues(
-                start = 20.dp,
-                end = 20.dp,
-                top = 104.dp,
-                bottom = 148.dp
-            )
-        ) {
-            item {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.Bottom
-                ) {
-                    Column(
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        modifier = Modifier.weight(1f)
+                .fillMaxSize()
+        ) { page ->
+            when (HubTab.entries[page]) {
+                HubTab.THREADS -> {
+                    LazyColumn(
+                        state = threadsListState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            start = 20.dp,
+                            end = 20.dp,
+                            top = 104.dp,
+                            bottom = 148.dp
+                        )
                     ) {
-                        Text(
-                            text = if (selectedTab == HubTab.THREADS) "All Threads" else "Workspaces",
-                            style = MaterialTheme.typography.displaySmall,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            modifier = Modifier.testTag("threads_hub_title")
-                        )
-                        Text(
-                            text = if (selectedTab == HubTab.THREADS) {
-                                "${filteredThreads.size} ${if (showArchived) "archived" else "active"} conversations"
-                            } else {
-                                "${workspaces.size} local workspaces with scoped instructions"
-                            },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
+                        item(key = "threads_header") {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 16.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.Bottom
+                            ) {
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(
+                                        text = "All Threads",
+                                        style = MaterialTheme.typography.displaySmall,
+                                        color = MaterialTheme.colorScheme.onBackground,
+                                        modifier = Modifier.testTag("threads_hub_title")
+                                    )
+                                    Text(
+                                        text = "${filteredThreads.size} ${if (showArchived) "archived" else "active"} conversations",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
 
-                    if (selectedTab == HubTab.THREADS) {
-                        Surface(
-                            onClick = { showArchived = !showArchived },
-                            shape = RoundedCornerShape(20.dp),
-                            color = if (showArchived) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                semantic.floatingSurface
-                            },
-                            contentColor = if (showArchived) {
-                                MaterialTheme.colorScheme.onPrimary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                            border = BorderStroke(
-                                1.dp,
-                                if (showArchived) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.outlineVariant
-                            ),
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("toggle_archived_filter")
-                        ) {
-                            Text(
-                                text = if (showArchived) "Archived" else "Active",
-                                style = MaterialTheme.typography.labelMedium,
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
-                            )
-                        }
-                    }
-                }
-            }
-
-            item {
-                AnimatedVisibility(
-                    visible = searchOpen,
-                    enter = if (reducedMotion) EnterTransition.None else fadeIn() + expandVertically(),
-                    exit = if (reducedMotion) ExitTransition.None else fadeOut() + shrinkVertically()
-                ) {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = { Text("Search threads by title or model...") },
-                        singleLine = true,
-                        leadingIcon = {
-                            Icon(Icons.Rounded.Search, contentDescription = null, modifier = Modifier.size(18.dp))
-                        },
-                        trailingIcon = {
-                            if (searchQuery.isNotEmpty()) {
-                                IconButton(onClick = { searchQuery = "" }) {
-                                    Icon(Icons.Rounded.Close, contentDescription = "Clear search", modifier = Modifier.size(18.dp))
+                                Surface(
+                                    onClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        showArchived = !showArchived
+                                    },
+                                    shape = RoundedCornerShape(20.dp),
+                                    color = if (showArchived) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        semantic.floatingSurface
+                                    },
+                                    contentColor = if (showArchived) {
+                                        MaterialTheme.colorScheme.onPrimary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (showArchived) MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.outlineVariant
+                                    ),
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("toggle_archived_filter")
+                                ) {
+                                    AnimatedContent(
+                                        targetState = if (showArchived) "Archived" else "Active",
+                                        transitionSpec = {
+                                            if (reducedMotion) {
+                                                EnterTransition.None togetherWith ExitTransition.None
+                                            } else {
+                                                fadeIn(tween(MotionTokens.DurationQuickMs)) togetherWith
+                                                    fadeOut(tween(MotionTokens.DurationQuickMs))
+                                            }
+                                        },
+                                        label = "archivedFilterText"
+                                    ) { label ->
+                                        Text(
+                                            text = label,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                                        )
+                                    }
                                 }
                             }
-                        },
-                        shape = RoundedCornerShape(24.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedContainerColor = MaterialTheme.colorScheme.surface,
-                            unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 16.dp)
-                    )
-                }
-            }
+                        }
 
-            if (selectedTab == HubTab.THREADS) {
-                if (filteredThreads.isEmpty()) {
-                    item {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 40.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Text(
-                                text = if (showArchived) "No archived threads" else "No matching threads",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = "Start a new on-device conversation below or switch filter.",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                } else {
-                    if (pinnedThreads.isNotEmpty()) {
-                        item {
-                            Text(
-                                text = "Pinned",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
-                            )
-                        }
-                        itemsIndexed(pinnedThreads, key = { _, t -> "pin_${t.id}" }) { index, thread ->
-                            ThreadListRow(
-                                thread = thread,
-                                workspaceName = workspaceMap[thread.workspaceId]?.name,
-                                isSelected = thread.id == activeThreadId,
-                                onClick = {
-                                    onSelectThread(thread.id)
-                                    onBackToWorkbench()
-                                },
-                                onRename = {
-                                    renameInput = thread.title
-                                    renameTarget = thread
-                                },
-                                onTogglePin = { onTogglePinThread(thread.id) },
-                                onToggleArchive = { onToggleArchiveThread(thread.id) },
-                                onDelete = { onDeleteThread(thread.id) }
-                            )
-                            if (index < pinnedThreads.lastIndex || recentThreads.isNotEmpty()) {
-                                HorizontalDivider(
-                                    thickness = 0.5.dp,
-                                    color = MaterialTheme.colorScheme.outlineVariant
+                        item(key = "threads_search") {
+                            AnimatedVisibility(
+                                visible = searchOpen,
+                                enter = if (reducedMotion) EnterTransition.None else (
+                                    fadeIn(tween(MotionTokens.DurationStandardMs)) +
+                                        expandVertically(animationSpec = MotionTokens.snappySpring())
+                                    ),
+                                exit = if (reducedMotion) ExitTransition.None else (
+                                    fadeOut(tween(MotionTokens.DurationQuickMs)) +
+                                        shrinkVertically(animationSpec = MotionTokens.snappySpring())
+                                    )
+                            ) {
+                                OutlinedTextField(
+                                    value = searchQuery,
+                                    onValueChange = { searchQuery = it },
+                                    placeholder = { Text("Search threads by title or model...") },
+                                    singleLine = true,
+                                    leadingIcon = {
+                                        Icon(Icons.Rounded.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    },
+                                    trailingIcon = {
+                                        if (searchQuery.isNotEmpty()) {
+                                            IconButton(onClick = { searchQuery = "" }) {
+                                                Icon(Icons.Rounded.Close, contentDescription = "Clear search", modifier = Modifier.size(18.dp))
+                                            }
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(24.dp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedContainerColor = MaterialTheme.colorScheme.surface,
+                                        unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                        unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(bottom = 16.dp)
                                 )
                             }
                         }
-                    }
 
-                    if (recentThreads.isNotEmpty()) {
-                        item {
-                            Text(
-                                text = if (showArchived) "Archived" else "Recents",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(top = 12.dp, bottom = 8.dp)
-                            )
-                        }
-                        itemsIndexed(recentThreads, key = { _, t -> t.id }) { index, thread ->
-                            ThreadListRow(
-                                thread = thread,
-                                workspaceName = workspaceMap[thread.workspaceId]?.name,
-                                isSelected = thread.id == activeThreadId,
-                                onClick = {
-                                    onSelectThread(thread.id)
-                                    onBackToWorkbench()
-                                },
-                                onRename = {
-                                    renameInput = thread.title
-                                    renameTarget = thread
-                                },
-                                onTogglePin = { onTogglePinThread(thread.id) },
-                                onToggleArchive = { onToggleArchiveThread(thread.id) },
-                                onDelete = { onDeleteThread(thread.id) }
-                            )
-                            if (index < recentThreads.lastIndex) {
-                                HorizontalDivider(
-                                    thickness = 0.5.dp,
-                                    color = MaterialTheme.colorScheme.outlineVariant
-                                )
+                        if (filteredThreads.isEmpty()) {
+                            item(key = "threads_empty") {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 40.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Text(
+                                        text = if (showArchived) "No archived threads" else "No matching threads",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = "Start a new on-device conversation below or switch filter.",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        } else {
+                            if (pinnedThreads.isNotEmpty()) {
+                                item(key = "pinned_section_header") {
+                                    Text(
+                                        text = "Pinned",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+                                    )
+                                }
+                                itemsIndexed(pinnedThreads, key = { _, t -> "pin_${t.id}" }) { index, thread ->
+                                    Column(
+                                        modifier = Modifier.animateItem(
+                                            fadeInSpec = if (reducedMotion) null else tween(
+                                                MotionTokens.DurationStandardMs,
+                                                easing = MotionTokens.EaseOutStrong
+                                            ),
+                                            fadeOutSpec = if (reducedMotion) null else tween(MotionTokens.DurationQuickMs),
+                                            placementSpec = if (reducedMotion) null else MotionTokens.listItemSpring<IntOffset>()
+                                        )
+                                    ) {
+                                        ThreadListRow(
+                                            thread = thread,
+                                            workspaceName = workspaceMap[thread.workspaceId]?.name,
+                                            isSelected = thread.id == activeThreadId,
+                                            onClick = {
+                                                onSelectThread(thread.id)
+                                                onBackToWorkbench()
+                                            },
+                                            onRename = {
+                                                renameInput = thread.title
+                                                renameTarget = thread
+                                            },
+                                            onTogglePin = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                onTogglePinThread(thread.id)
+                                            },
+                                            onToggleArchive = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                onToggleArchiveThread(thread.id)
+                                            },
+                                            onDelete = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                onDeleteThread(thread.id)
+                                            }
+                                        )
+                                        if (index < pinnedThreads.lastIndex || recentThreads.isNotEmpty()) {
+                                            HorizontalDivider(
+                                                thickness = 0.5.dp,
+                                                color = MaterialTheme.colorScheme.outlineVariant
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (recentThreads.isNotEmpty()) {
+                                item(key = "recent_section_header") {
+                                    Text(
+                                        text = if (showArchived) "Archived" else "Recents",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(top = 12.dp, bottom = 8.dp)
+                                    )
+                                }
+                                itemsIndexed(recentThreads, key = { _, t -> t.id }) { index, thread ->
+                                    Column(
+                                        modifier = Modifier.animateItem(
+                                            fadeInSpec = if (reducedMotion) null else tween(
+                                                MotionTokens.DurationStandardMs,
+                                                easing = MotionTokens.EaseOutStrong
+                                            ),
+                                            fadeOutSpec = if (reducedMotion) null else tween(MotionTokens.DurationQuickMs),
+                                            placementSpec = if (reducedMotion) null else MotionTokens.listItemSpring<IntOffset>()
+                                        )
+                                    ) {
+                                        ThreadListRow(
+                                            thread = thread,
+                                            workspaceName = workspaceMap[thread.workspaceId]?.name,
+                                            isSelected = thread.id == activeThreadId,
+                                            onClick = {
+                                                onSelectThread(thread.id)
+                                                onBackToWorkbench()
+                                            },
+                                            onRename = {
+                                                renameInput = thread.title
+                                                renameTarget = thread
+                                            },
+                                            onTogglePin = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                onTogglePinThread(thread.id)
+                                            },
+                                            onToggleArchive = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                onToggleArchiveThread(thread.id)
+                                            },
+                                            onDelete = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                onDeleteThread(thread.id)
+                                            }
+                                        )
+                                        if (index < recentThreads.lastIndex) {
+                                            HorizontalDivider(
+                                                thickness = 0.5.dp,
+                                                color = MaterialTheme.colorScheme.outlineVariant
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            } else {
-                // Workspaces view modeled after Cursor iOS Screenshot 2
-                itemsIndexed(workspaces, key = { _, ws -> ws.id }) { _, workspace ->
-                    val count = threads.count { it.workspaceId == workspace.id && !it.isArchived }
-                    val isCurrent = workspace.id == activeWorkspaceId
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .minimumInteractiveComponentSize()
-                            .clickable {
-                                onSelectWorkspace(workspace.id)
-                                onBackToWorkbench()
-                            }
-                            .padding(vertical = 15.dp)
-                            .testTag("workspace_row_${workspace.id}"),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (workspace.isDefault) Icons.Rounded.Home else Icons.Rounded.FolderOpen,
-                            contentDescription = null,
-                            tint = if (isCurrent) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                            modifier = Modifier.size(21.dp)
+
+                HubTab.WORKSPACES -> {
+                    LazyColumn(
+                        state = workspacesListState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(
+                            start = 20.dp,
+                            end = 20.dp,
+                            top = 104.dp,
+                            bottom = 148.dp
                         )
-                        Column(
-                            modifier = Modifier.weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            Text(
-                                text = workspace.name,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = workspace.systemPrompt,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                    ) {
+                        item(key = "workspaces_header") {
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 16.dp)
+                            ) {
+                                Text(
+                                    text = "Workspaces",
+                                    style = MaterialTheme.typography.displaySmall,
+                                    color = MaterialTheme.colorScheme.onBackground
+                                )
+                                Text(
+                                    text = "${workspaces.size} local workspaces with scoped instructions",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
-                        if (!workspace.isDefault) {
-                            IconButton(
-                                onClick = { onDeleteWorkspace(workspace.id) },
-                                modifier = Modifier.size(40.dp)
+
+                        itemsIndexed(workspaces, key = { _, ws -> ws.id }) { _, workspace ->
+                            val count = threads.count { it.workspaceId == workspace.id && !it.isArchived }
+                            val isCurrent = workspace.id == activeWorkspaceId
+                            Column(
+                                modifier = Modifier.animateItem(
+                                    fadeInSpec = if (reducedMotion) null else tween(
+                                        MotionTokens.DurationStandardMs,
+                                        easing = MotionTokens.EaseOutStrong
+                                    ),
+                                    fadeOutSpec = if (reducedMotion) null else tween(MotionTokens.DurationQuickMs),
+                                    placementSpec = if (reducedMotion) null else MotionTokens.listItemSpring<IntOffset>()
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .minimumInteractiveComponentSize()
+                                        .clickable {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onSelectWorkspace(workspace.id)
+                                            onBackToWorkbench()
+                                        }
+                                        .padding(vertical = 15.dp)
+                                        .testTag("workspace_row_${workspace.id}"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (workspace.isDefault) Icons.Rounded.Home else LocalMindIcons.FolderOpen,
+                                        contentDescription = null,
+                                        tint = if (isCurrent) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        modifier = Modifier.size(21.dp)
+                                    )
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        Text(
+                                            text = workspace.name,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = workspace.systemPrompt,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    if (!workspace.isDefault) {
+                                        IconButton(
+                                            onClick = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                onDeleteWorkspace(workspace.id)
+                                            },
+                                            modifier = Modifier.size(40.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = LocalMindIcons.DeleteOutline,
+                                                contentDescription = "Delete workspace",
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        text = count.toString(),
+                                        style = MaterialTheme.typography.labelLarge.tabular(),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                                HorizontalDivider(
+                                    thickness = 0.5.dp,
+                                    color = MaterialTheme.colorScheme.outlineVariant
+                                )
+                            }
+                        }
+
+                        item(key = "add_workspace_footer") {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .minimumInteractiveComponentSize()
+                                    .clickable { showNewWorkspaceDialog = true }
+                                    .padding(vertical = 16.dp)
+                                    .testTag("add_workspace_row"),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(14.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Rounded.DeleteOutline,
-                                    contentDescription = "Delete workspace",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                                    modifier = Modifier.size(18.dp)
+                                    imageVector = LocalMindIcons.CreateNewFolder,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(21.dp)
+                                )
+                                Text(
+                                    text = "Add Workspace",
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.weight(1f)
                                 )
                             }
+                            HorizontalDivider(
+                                thickness = 0.5.dp,
+                                color = MaterialTheme.colorScheme.outlineVariant
+                            )
                         }
-                        Text(
-                            text = count.toString(),
-                            style = MaterialTheme.typography.labelLarge.tabular(),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                            modifier = Modifier.size(20.dp)
-                        )
                     }
-                    HorizontalDivider(
-                        thickness = 0.5.dp,
-                        color = MaterialTheme.colorScheme.outlineVariant
-                    )
-                }
-
-                // Trailing "Add Workspace" row
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .minimumInteractiveComponentSize()
-                            .clickable { showNewWorkspaceDialog = true }
-                            .padding(vertical = 16.dp)
-                            .testTag("add_workspace_row"),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.CreateNewFolder,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(21.dp)
-                        )
-                        Text(
-                            text = "Add Workspace",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                    HorizontalDivider(
-                        thickness = 0.5.dp,
-                        color = MaterialTheme.colorScheme.outlineVariant
-                    )
                 }
             }
         }
@@ -579,49 +699,43 @@ fun ThreadsHubScreen(
                     modifier = Modifier.testTag("nav_workbench")
                 )
 
-                // Segmented Cursor Pill Switch (Threads | Workspaces)
-                Surface(
-                    shape = RoundedCornerShape(24.dp),
-                    color = semantic.floatingSurface,
-                    shadowElevation = if (semantic.isDark) 2.dp else 5.dp,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.85f))
-                ) {
-                    Row(
-                        modifier = Modifier.padding(4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        HubTab.entries.forEach { tab ->
-                            val selected = selectedTab == tab
-                            Surface(
-                                onClick = { selectedTab = tab },
-                                shape = RoundedCornerShape(20.dp),
-                                color = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                contentColor = if (selected) {
-                                    MaterialTheme.colorScheme.onPrimary
-                                } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .testTag("hub_tab_${tab.name.lowercase()}")
-                            ) {
-                                Text(
-                                    text = tab.label,
-                                    style = MaterialTheme.typography.labelMedium,
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                SegmentedPillSwitcher(
+                    labels = HubTab.entries.map { it.label },
+                    selectedIndex = pagerState.currentPage,
+                    onSelect = { index ->
+                        coroutineScope.launch {
+                            if (reducedMotion) {
+                                pagerState.scrollToPage(index)
+                            } else {
+                                pagerState.animateScrollToPage(
+                                    page = index,
+                                    animationSpec = MotionTokens.pageSpring()
                                 )
                             }
                         }
-                    }
-                }
+                    },
+                    testTags = HubTab.entries.map { "hub_tab_${it.name.lowercase()}" },
+                    positionProvider = { pagerState.currentPage + pagerState.currentPageOffsetFraction },
+                    containerColor = semantic.floatingSurface,
+                    borderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.85f),
+                    shadowElevation = if (semantic.isDark) 2.dp else 5.dp,
+                    itemHorizontalPadding = 12.dp,
+                    itemVerticalPadding = 8.dp
+                )
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FloatingCircleButton(
-                        onClick = { searchOpen = !searchOpen },
-                        icon = if (searchOpen) Icons.Rounded.Close else Icons.Rounded.Search,
-                        contentDescription = "Search threads",
-                        iconSize = 20.dp
-                    )
+                    AnimatedVisibility(
+                        visible = pagerState.currentPage == HubTab.THREADS.ordinal,
+                        enter = if (reducedMotion) EnterTransition.None else fadeIn(tween(150)),
+                        exit = if (reducedMotion) ExitTransition.None else fadeOut(tween(110))
+                    ) {
+                        FloatingCircleButton(
+                            onClick = { searchOpen = !searchOpen },
+                            icon = if (searchOpen) Icons.Rounded.Close else Icons.Rounded.Search,
+                            contentDescription = "Search threads",
+                            iconSize = 20.dp
+                        )
+                    }
                     FloatingCircleButton(
                         onClick = {
                             onCreateThread(activeWorkspaceId, null)
@@ -682,7 +796,7 @@ fun ThreadsHubScreen(
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
-                                imageVector = Icons.Rounded.Storage,
+                                imageVector = LocalMindIcons.Storage,
                                 contentDescription = stringResource(R.string.btn_open_vault),
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.size(19.dp)
@@ -739,7 +853,7 @@ fun ThreadsHubScreen(
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
-                                imageVector = if (canStart) Icons.Rounded.ArrowUpward else Icons.Rounded.Add,
+                                imageVector = if (canStart) LocalMindIcons.ArrowUpward else Icons.Rounded.Add,
                                 contentDescription = "Start new thread",
                                 modifier = Modifier.size(20.dp)
                             )
@@ -795,7 +909,7 @@ private fun ThreadListRow(
             ) {
                 if (thread.isPinned) {
                     Icon(
-                        imageVector = Icons.Rounded.PushPin,
+                        imageVector = LocalMindIcons.PushPin,
                         contentDescription = "Pinned",
                         tint = MaterialTheme.colorScheme.secondary,
                         modifier = Modifier.size(14.dp)
@@ -834,7 +948,7 @@ private fun ThreadListRow(
                     .minimumInteractiveComponentSize()
             ) {
                 Icon(
-                    imageVector = Icons.Rounded.MoreHoriz,
+                    imageVector = LocalMindIcons.MoreHoriz,
                     contentDescription = "Thread actions",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -845,7 +959,7 @@ private fun ThreadListRow(
             ) {
                 DropdownMenuItem(
                     text = { Text(if (thread.isPinned) "Unpin" else "Pin to top") },
-                    leadingIcon = { Icon(Icons.Rounded.PushPin, contentDescription = null) },
+                    leadingIcon = { Icon(LocalMindIcons.PushPin, contentDescription = null) },
                     onClick = {
                         menuExpanded = false
                         onTogglePin()
@@ -863,7 +977,7 @@ private fun ThreadListRow(
                     text = { Text(if (thread.isArchived) "Unarchive" else "Archive") },
                     leadingIcon = {
                         Icon(
-                            if (thread.isArchived) Icons.Rounded.Unarchive else Icons.Rounded.Archive,
+                            if (thread.isArchived) LocalMindIcons.Unarchive else LocalMindIcons.Archive,
                             contentDescription = null
                         )
                     },
@@ -874,7 +988,7 @@ private fun ThreadListRow(
                 )
                 DropdownMenuItem(
                     text = { Text("Delete") },
-                    leadingIcon = { Icon(Icons.Rounded.DeleteOutline, contentDescription = null) },
+                    leadingIcon = { Icon(LocalMindIcons.DeleteOutline, contentDescription = null) },
                     onClick = {
                         menuExpanded = false
                         onDelete()

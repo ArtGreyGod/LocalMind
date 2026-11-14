@@ -73,8 +73,21 @@ if (DEFINED ANDROID_ABI AND ANDROID_ABI STREQUAL "arm64-v8a")
         -O3
         -march=armv8.2-a+dotprod+fp16
         -fvisibility=hidden
+        -ffunction-sections
+        -fdata-sections
+    )
+else()
+    target_compile_options(llama_jni PRIVATE
+        -fvisibility=hidden
+        -ffunction-sections
+        -fdata-sections
     )
 endif()
+
+target_link_options(llama_jni PRIVATE
+    -Wl,--gc-sections
+    $<$<NOT:$<CONFIG:Debug>>:-Wl,-s>
+)
 
 target_link_libraries(llama_jni PRIVATE
     llama

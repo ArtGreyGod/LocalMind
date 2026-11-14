@@ -1,21 +1,54 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# LocalMind R8 / ProGuard Keep Rules
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Preserve stack trace line numbers for crash diagnostics while keeping APK compact
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# llama.cpp JNI bridge & native -> Kotlin stream callback
+-keep class com.example.data.engine.LlamaCppNativeBridge {
+    native <methods>;
+}
+-keepclassmembers class com.example.data.engine.LlamaCppNativeBridge {
+    native <methods>;
+}
+-keep interface com.example.data.engine.LlamaStreamCallback { *; }
+-keep class * implements com.example.data.engine.LlamaStreamCallback { *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# LiteRT & LiteRT-LM native JNI bridges and runtime types
+-keep class com.google.ai.edge.litert.** { *; }
+-keep class com.google.ai.edge.litertlm.** { *; }
+-dontwarn com.google.ai.edge.litert.**
+-dontwarn com.google.ai.edge.litertlm.**
+
+# kotlinx.serialization (generated serializers, Companion objects, nav @Serializable routes)
+-keepattributes *Annotation*,InnerClasses
+-dontnote kotlinx.serialization.AnnotationsKt
+-keepclassmembers class kotlinx.serialization.json.** {
+    *** Companion;
+}
+-keepclasseswithmembers class kotlinx.serialization.json.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+-keep,includedescriptorclasses class com.example.**$$serializer { *; }
+-keepclassmembers class com.example.** {
+    *** Companion;
+}
+-keepclasseswithmembers class com.example.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+-keep @kotlinx.serialization.Serializable class com.example.** { *; }
+
+# Room entities, DAOs, and Database constructor
+-keep class * extends androidx.room.RoomDatabase
+-keep class com.example.data.local.** { *; }
+-dontwarn androidx.room.**
+
+# OkHttp / Coroutines / CameraX safe ignores
+-dontwarn okhttp3.**
+-dontwarn okio.**
+-dontwarn javax.annotation.**
+-dontwarn org.codehaus.mojo.animal_snuffers.**
+-dontwarn org.conscrypt.**
+-dontwarn org.bouncycastle.**
+-dontwarn org.openjsse.**
+

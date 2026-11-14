@@ -9,6 +9,8 @@ import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
@@ -21,13 +23,6 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.ChatBubbleOutline
-import androidx.compose.material.icons.outlined.Forum
-import androidx.compose.material.icons.outlined.Storage
-import androidx.compose.material.icons.rounded.ChatBubble
-import androidx.compose.material.icons.rounded.Forum
-import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
@@ -48,11 +43,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavDestination
 import androidx.navigation.NavDestination.Companion.hasRoute
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -60,6 +58,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.data.storage.AppThemeMode
+import com.example.ui.components.LocalMindIcons
 import com.example.ui.components.TelemetryAndTuningSheet
 import com.example.ui.screens.ChatScreen
 import com.example.ui.screens.ModelManagerScreen
@@ -70,6 +69,7 @@ import com.example.ui.theme.MotionTokens
 import com.example.ui.theme.rememberPrefersReducedMotion
 import com.example.ui.viewmodel.LocalMindViewModel
 import kotlinx.serialization.Serializable
+import kotlin.math.roundToInt
 
 @Serializable
 object WorkbenchRoute
@@ -79,6 +79,13 @@ object ThreadsRoute
 
 @Serializable
 object VaultRoute
+
+private fun NavDestination?.spatialOrder(): Int = when {
+    this?.hasRoute<ThreadsRoute>() == true -> -1
+    this?.hasRoute<WorkbenchRoute>() == true -> 0
+    this?.hasRoute<VaultRoute>() == true -> 1
+    else -> 0
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -120,6 +127,7 @@ fun LocalMindRootScreen(
 
     val reducedMotion = rememberPrefersReducedMotion()
     val semantic = LocalSemanticColors.current
+    val haptics = LocalHapticFeedback.current
 
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
@@ -227,10 +235,13 @@ fun LocalMindRootScreen(
                     ) {
                         NavigationRailItem(
                             selected = isWorkbenchSelected,
-                            onClick = { navigateToRoute(WorkbenchRoute) },
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                navigateToRoute(WorkbenchRoute)
+                            },
                             icon = {
                                 Icon(
-                                    imageVector = if (isWorkbenchSelected) Icons.Rounded.ChatBubble else Icons.Outlined.ChatBubbleOutline,
+                                    imageVector = if (isWorkbenchSelected) LocalMindIcons.ChatBubble else LocalMindIcons.ChatBubbleOutline,
                                     contentDescription = null
                                 )
                             },
@@ -245,10 +256,13 @@ fun LocalMindRootScreen(
                         )
                         NavigationRailItem(
                             selected = isThreadsSelected,
-                            onClick = { navigateToRoute(ThreadsRoute) },
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                navigateToRoute(ThreadsRoute)
+                            },
                             icon = {
                                 Icon(
-                                    imageVector = if (isThreadsSelected) Icons.Rounded.Forum else Icons.Outlined.Forum,
+                                    imageVector = if (isThreadsSelected) LocalMindIcons.Forum else LocalMindIcons.ForumOutlined,
                                     contentDescription = null
                                 )
                             },
@@ -263,10 +277,13 @@ fun LocalMindRootScreen(
                         )
                         NavigationRailItem(
                             selected = isVaultSelected,
-                            onClick = { navigateToRoute(VaultRoute) },
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                navigateToRoute(VaultRoute)
+                            },
                             icon = {
                                 Icon(
-                                    imageVector = if (isVaultSelected) Icons.Rounded.Storage else Icons.Outlined.Storage,
+                                    imageVector = if (isVaultSelected) LocalMindIcons.Storage else LocalMindIcons.StorageOutlined,
                                     contentDescription = null
                                 )
                             },
@@ -291,12 +308,48 @@ fun LocalMindRootScreen(
                         navController = navController,
                         startDestination = WorkbenchRoute,
                         enterTransition = {
-                            if (reducedMotion) EnterTransition.None
-                            else fadeIn(tween(MotionTokens.DurationQuickMs, easing = MotionTokens.EaseOutStrong))
+                            if (reducedMotion) {
+                                EnterTransition.None
+                            } else {
+                                val delta = targetState.destination.spatialOrder() - initialState.destination.spatialOrder()
+                                val dir = if (delta >= 0) 1 else -1
+                                slideInHorizontally(animationSpec = MotionTokens.pageSpring()) { fullWidth ->
+                                    (fullWidth * 0.22f * dir).roundToInt()
+                                } + fadeIn(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong))
+                            }
                         },
                         exitTransition = {
-                            if (reducedMotion) ExitTransition.None
-                            else fadeOut(tween(110, easing = MotionTokens.EaseOutStrong))
+                            if (reducedMotion) {
+                                ExitTransition.None
+                            } else {
+                                val delta = targetState.destination.spatialOrder() - initialState.destination.spatialOrder()
+                                val dir = if (delta >= 0) 1 else -1
+                                slideOutHorizontally(animationSpec = MotionTokens.pageSpring()) { fullWidth ->
+                                    (-fullWidth * 0.16f * dir).roundToInt()
+                                } + fadeOut(tween(130, easing = MotionTokens.EaseOutStrong))
+                            }
+                        },
+                        popEnterTransition = {
+                            if (reducedMotion) {
+                                EnterTransition.None
+                            } else {
+                                val delta = targetState.destination.spatialOrder() - initialState.destination.spatialOrder()
+                                val dir = if (delta >= 0) 1 else -1
+                                slideInHorizontally(animationSpec = MotionTokens.pageSpring()) { fullWidth ->
+                                    (fullWidth * 0.22f * dir).roundToInt()
+                                } + fadeIn(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong))
+                            }
+                        },
+                        popExitTransition = {
+                            if (reducedMotion) {
+                                ExitTransition.None
+                            } else {
+                                val delta = targetState.destination.spatialOrder() - initialState.destination.spatialOrder()
+                                val dir = if (delta >= 0) 1 else -1
+                                slideOutHorizontally(animationSpec = MotionTokens.pageSpring()) { fullWidth ->
+                                    (-fullWidth * 0.16f * dir).roundToInt()
+                                } + fadeOut(tween(130, easing = MotionTokens.EaseOutStrong))
+                            }
                         }
                     ) {
                         composable<WorkbenchRoute> {

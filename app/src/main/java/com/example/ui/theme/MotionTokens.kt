@@ -39,6 +39,21 @@ object MotionTokens {
         dampingRatio = 0.85f,
         stiffness = Spring.StiffnessMedium
     )
+
+    fun <T> pageSpring() = spring<T>(
+        dampingRatio = 0.88f,
+        stiffness = Spring.StiffnessMediumLow
+    )
+
+    fun <T> indicatorSpring() = spring<T>(
+        dampingRatio = 0.82f,
+        stiffness = Spring.StiffnessMedium
+    )
+
+    fun <T> listItemSpring() = spring<T>(
+        dampingRatio = 0.86f,
+        stiffness = Spring.StiffnessMediumLow
+    )
 }
 
 @Composable

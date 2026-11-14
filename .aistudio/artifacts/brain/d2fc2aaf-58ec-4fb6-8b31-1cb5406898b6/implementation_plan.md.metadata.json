@@ -1,6 +1,0 @@
-{
-  "summary":  "Implementation plan for LocalMind's next feature milestone based on user selections: Cursor-style All Agents threads & Workspaces backed by Room/KSP, swappable message branches, on-device RAG for PDF/text/code documents, in-app Hugging Face model browser & resumable downloader, voice dictation & offline TTS read-aloud, live context window gauge & trim, and a composer slash-command/template palette.",
-  "updatedAt":  "2026-11-13T15:00:04.284311282Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

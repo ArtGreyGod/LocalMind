@@ -26,11 +26,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
-import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.Description
-import androidx.compose.material.icons.rounded.GraphicEq
-import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -46,7 +42,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -109,7 +107,7 @@ fun AttachedDocumentsStrip(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.Description,
+                        imageVector = LocalMindIcons.Description,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.secondary,
                         modifier = Modifier.size(15.dp)
@@ -209,7 +207,7 @@ fun SlashCommandPopover(
                         }
                     }
                     Icon(
-                        imageVector = Icons.Rounded.AutoAwesome,
+                        imageVector = LocalMindIcons.AutoAwesome,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
                         modifier = Modifier.size(16.dp)
@@ -263,7 +261,7 @@ fun VoiceListeningBanner(
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Icon(
-                imageVector = Icons.Rounded.GraphicEq,
+                imageVector = LocalMindIcons.GraphicEq,
                 contentDescription = null,
                 tint = semantic.liveEmerald,
                 modifier = Modifier
@@ -359,6 +357,7 @@ fun BranchSwitcherPill(
     val hasPrev = currentIdx > 0
     val hasNext = currentIdx < siblingIds.lastIndex
 
+    val haptics = LocalHapticFeedback.current
     Surface(
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -370,7 +369,12 @@ fun BranchSwitcherPill(
             horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
             IconButton(
-                onClick = { if (hasPrev) onSelectBranch(siblingIds[currentIdx - 1]) },
+                onClick = {
+                    if (hasPrev) {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSelectBranch(siblingIds[currentIdx - 1])
+                    }
+                },
                 enabled = hasPrev,
                 modifier = Modifier
                     .size(36.dp)
@@ -389,7 +393,12 @@ fun BranchSwitcherPill(
                 color = MaterialTheme.colorScheme.onSurface
             )
             IconButton(
-                onClick = { if (hasNext) onSelectBranch(siblingIds[currentIdx + 1]) },
+                onClick = {
+                    if (hasNext) {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSelectBranch(siblingIds[currentIdx + 1])
+                    }
+                },
                 enabled = hasNext,
                 modifier = Modifier
                     .size(36.dp)
@@ -433,7 +442,7 @@ fun CitationsChipRow(
                     horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.Description,
+                        imageVector = LocalMindIcons.Description,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.secondary,
                         modifier = Modifier.size(13.dp)
@@ -499,7 +508,7 @@ fun PendingAttachmentCard(
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Rounded.Visibility,
+                                imageVector = LocalMindIcons.Visibility,
                                 contentDescription = null,
                                 tint = MaterialTheme.colorScheme.secondary,
                                 modifier = Modifier.size(14.dp)

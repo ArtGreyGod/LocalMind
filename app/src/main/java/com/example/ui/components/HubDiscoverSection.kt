@@ -1,6 +1,9 @@
 package com.example.ui.components
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -22,10 +25,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.CloudDownload
-import androidx.compose.material.icons.rounded.ExpandLess
-import androidx.compose.material.icons.rounded.ExpandMore
-import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.CircularProgressIndicator
@@ -48,6 +47,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -59,6 +60,8 @@ import com.example.data.hub.HfRepoSummary
 import com.example.data.hub.ModelDownloadTask
 import com.example.domain.engine.MemoryStats
 import com.example.ui.theme.LocalSemanticColors
+import com.example.ui.theme.MotionTokens
+import com.example.ui.theme.rememberPrefersReducedMotion
 import com.example.ui.theme.tabular
 import com.example.ui.viewmodel.HubBrowserState
 import java.util.Locale
@@ -76,6 +79,7 @@ fun HubDiscoverColumn(
     modifier: Modifier = Modifier
 ) {
     val semantic = LocalSemanticColors.current
+    val haptics = LocalHapticFeedback.current
     var searchText by rememberSaveable { mutableStateOf(hubState.query) }
     var selectedCategory by rememberSaveable { mutableStateOf("All") }
     var expandedRepoIds by rememberSaveable { mutableStateOf(setOf<String>()) }
@@ -128,6 +132,7 @@ fun HubDiscoverColumn(
                 val selected = selectedCategory == cat
                 Surface(
                     onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         selectedCategory = cat
                         val query = if (cat == "All") "" else cat
                         searchText = query
@@ -256,6 +261,8 @@ private fun RepoItemCard(
     onPauseDownload: (String) -> Unit,
     onCancelDownload: (String) -> Unit
 ) {
+    val haptics = LocalHapticFeedback.current
+    val reducedMotion = rememberPrefersReducedMotion()
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -266,7 +273,10 @@ private fun RepoItemCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .minimumInteractiveComponentSize()
-                .clickable(onClick = onToggleExpand)
+                .clickable {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onToggleExpand()
+                }
                 .padding(vertical = 4.dp)
                 .testTag("hub_repo_${repo.repoId}"),
             verticalAlignment = Alignment.CenterVertically,
@@ -289,7 +299,7 @@ private fun RepoItemCard(
                 )
             }
             Icon(
-                imageVector = if (isExpanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
+                imageVector = if (isExpanded) LocalMindIcons.ExpandLess else LocalMindIcons.ExpandMore,
                 contentDescription = if (isExpanded) "Collapse files" else "Inspect files",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -297,8 +307,14 @@ private fun RepoItemCard(
 
         AnimatedVisibility(
             visible = isExpanded,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically()
+            enter = if (reducedMotion) EnterTransition.None else (
+                fadeIn(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong)) +
+                    expandVertically(animationSpec = MotionTokens.snappySpring())
+                ),
+            exit = if (reducedMotion) ExitTransition.None else (
+                fadeOut(tween(MotionTokens.DurationQuickMs)) +
+                    shrinkVertically(animationSpec = MotionTokens.snappySpring())
+                )
         ) {
             Column(
                 modifier = Modifier
@@ -384,7 +400,7 @@ private fun HubFileRow(
                 when (task?.status) {
                     DownloadStatus.DOWNLOADING -> {
                         IconButton(onClick = onPause, modifier = Modifier.size(40.dp)) {
-                            Icon(Icons.Rounded.Pause, contentDescription = "Pause download")
+                            Icon(LocalMindIcons.Pause, contentDescription = "Pause download")
                         }
                         IconButton(onClick = onCancel, modifier = Modifier.size(40.dp)) {
                             Icon(Icons.Rounded.Close, contentDescription = "Cancel download")
@@ -422,7 +438,7 @@ private fun HubFileRow(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
-                                Icon(Icons.Rounded.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Icon(LocalMindIcons.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Text("Get", style = MaterialTheme.typography.labelMedium)
                             }
                         }
@@ -484,7 +500,7 @@ private fun DownloadProgressCard(
                 Row {
                     if (task.status == DownloadStatus.DOWNLOADING) {
                         IconButton(onClick = onPause, modifier = Modifier.size(36.dp)) {
-                            Icon(Icons.Rounded.Pause, contentDescription = "Pause", modifier = Modifier.size(18.dp))
+                            Icon(LocalMindIcons.Pause, contentDescription = "Pause", modifier = Modifier.size(18.dp))
                         }
                     } else {
                         IconButton(onClick = onResume, modifier = Modifier.size(36.dp)) {

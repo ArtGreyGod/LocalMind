@@ -37,19 +37,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.DeleteOutline
-import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Search
-import androidx.compose.material.icons.rounded.Visibility
-import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -69,6 +67,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -77,11 +76,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.hub.HfModelFile
@@ -94,6 +96,8 @@ import com.example.domain.engine.ModelFormat
 import com.example.ui.components.FloatingCircleButton
 import com.example.ui.components.FloatingPillButton
 import com.example.ui.components.HubDiscoverColumn
+import com.example.ui.components.LocalMindIcons
+import com.example.ui.components.SegmentedPillSwitcher
 import com.example.ui.components.WrapFlowRow
 import com.example.ui.theme.LocalSemanticColors
 import com.example.ui.theme.MotionTokens
@@ -102,6 +106,7 @@ import com.example.ui.theme.rememberPrefersReducedMotion
 import com.example.ui.theme.tabular
 import com.example.ui.viewmodel.HubBrowserState
 import com.example.ui.viewmodel.PendingPreflightWarning
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 private enum class VaultTab(val label: String) {
@@ -134,11 +139,15 @@ fun ModelManagerScreen(
     onCancelHubDownload: (String) -> Unit = {}
 ) {
     var pendingPairTargetId by remember { mutableStateOf<String?>(null) }
-    var selectedTab by rememberSaveable { mutableStateOf(VaultTab.INSTALLED) }
     var searchOpen by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     val reducedMotion = rememberPrefersReducedMotion()
     val semantic = LocalSemanticColors.current
+    val haptics = LocalHapticFeedback.current
+    val coroutineScope = rememberCoroutineScope()
+    val pagerState = rememberPagerState(initialPage = VaultTab.INSTALLED.ordinal) { VaultTab.entries.size }
+    val installedListState = rememberLazyListState()
+    val discoverListState = rememberLazyListState()
 
     val modelPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -163,7 +172,7 @@ fun ModelManagerScreen(
             onDismissRequest = onDismissPreflightWarning,
             icon = {
                 Icon(
-                    imageVector = Icons.Rounded.WarningAmber,
+                    imageVector = LocalMindIcons.WarningAmber,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.tertiary
                 )
@@ -216,112 +225,52 @@ fun ModelManagerScreen(
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
     ) {
-        // Main scrollable workspace list
-        LazyColumn(
+        // Main scrollable workspace column with gliding switcher + swipeable Installed/Discover pager
+        Column(
             modifier = Modifier
                 .widthIn(max = 720.dp)
                 .align(Alignment.TopCenter)
-                .fillMaxSize(),
-            contentPadding = PaddingValues(
-                start = 20.dp,
-                end = 20.dp,
-                top = 104.dp,
-                bottom = 128.dp
-            )
+                .fillMaxSize()
         ) {
-            // Bold Cursor-style 32sp Display Header ("Model Vault") + Installed / Discover toggle
-            item {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = "Model Vault",
-                        style = MaterialTheme.typography.displaySmall,
-                        color = MaterialTheme.colorScheme.onBackground
-                    )
-                    Text(
-                        text = "On-device GGUF, LiteRT-LM & Hugging Face weights",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Surface(
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.surfaceContainerLow,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                        modifier = Modifier.padding(top = 4.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            VaultTab.entries.forEach { tab ->
-                                val isTabSelected = selectedTab == tab
-                                Surface(
-                                    onClick = { selectedTab = tab },
-                                    shape = RoundedCornerShape(20.dp),
-                                    color = if (isTabSelected) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                    contentColor = if (isTabSelected) {
-                                        MaterialTheme.colorScheme.onPrimary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    },
-                                    modifier = Modifier
-                                        .minimumInteractiveComponentSize()
-                                        .testTag("vault_tab_${tab.name.lowercase()}")
-                                ) {
-                                    Text(
-                                        text = tab.label,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                                    )
-                                }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .statusBarsPadding()
+                    .padding(top = 74.dp, start = 20.dp, end = 20.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Model Vault",
+                    style = MaterialTheme.typography.displaySmall,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+                Text(
+                    text = "On-device GGUF, LiteRT-LM & Hugging Face weights",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                SegmentedPillSwitcher(
+                    labels = VaultTab.entries.map { it.label },
+                    selectedIndex = pagerState.currentPage,
+                    onSelect = { index ->
+                        coroutineScope.launch {
+                            if (reducedMotion) {
+                                pagerState.scrollToPage(index)
+                            } else {
+                                pagerState.animateScrollToPage(
+                                    page = index,
+                                    animationSpec = MotionTokens.pageSpring()
+                                )
                             }
                         }
-                    }
-                }
-            }
+                    },
+                    testTags = VaultTab.entries.map { "vault_tab_${it.name.lowercase()}" },
+                    positionProvider = { pagerState.currentPage + pagerState.currentPageOffsetFraction },
+                    itemHorizontalPadding = 16.dp,
+                    itemVerticalPadding = 8.dp,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
 
-            // Expandable Search Bar
-            item {
-                AnimatedVisibility(
-                    visible = searchOpen,
-                    enter = if (reducedMotion) EnterTransition.None else fadeIn() + expandVertically(),
-                    exit = if (reducedMotion) ExitTransition.None else fadeOut() + shrinkVertically()
-                ) {
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = { Text("Filter local models...") },
-                        singleLine = true,
-                        leadingIcon = {
-                            Icon(Icons.Rounded.Search, contentDescription = null, modifier = Modifier.size(18.dp))
-                        },
-                        trailingIcon = {
-                            if (searchQuery.isNotEmpty()) {
-                                IconButton(onClick = { searchQuery = "" }) {
-                                    Icon(Icons.Rounded.Close, contentDescription = "Clear search", modifier = Modifier.size(18.dp))
-                                }
-                            }
-                        },
-                        shape = RoundedCornerShape(24.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedContainerColor = MaterialTheme.colorScheme.surface,
-                            unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 16.dp)
-                    )
-                }
-            }
-
-            // Active Import Progress Banner
-            item {
                 AnimatedVisibility(
                     visible = importProgress != null,
                     enter = if (reducedMotion) EnterTransition.None else (
@@ -336,114 +285,210 @@ fun ModelManagerScreen(
                     importProgress?.let { prog ->
                         ImportProgressBanner(
                             progress = prog,
-                            modifier = Modifier.padding(bottom = 16.dp)
+                            modifier = Modifier.padding(top = 4.dp)
                         )
                     }
                 }
             }
 
-            if (selectedTab == VaultTab.DISCOVER) {
-                item {
-                    HubDiscoverColumn(
-                        hubState = hubState,
-                        downloads = hubDownloads,
-                        memoryStats = memoryStats,
-                        onSearchHubModels = onSearchHubModels,
-                        onLoadRepoFiles = onLoadHubRepoFiles,
-                        onDownloadFile = onDownloadHubFile,
-                        onPauseDownload = onPauseHubDownload,
-                        onCancelDownload = onCancelHubDownload
-                    )
-                }
-            } else if (models.isEmpty()) {
-                item {
-                    EmptyVaultSection(
-                        onImportClick = { modelPickerLauncher.launch(arrayOf("*/*")) }
-                    )
-                }
-            } else {
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 6.dp, bottom = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Installed",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Text(
-                            text = "${filteredModels.size}",
-                            style = MaterialTheme.typography.labelMedium.tabular(),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+            HorizontalPager(
+                state = pagerState,
+                beyondViewportPageCount = 1,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            ) { page ->
+                when (VaultTab.entries[page]) {
+                    VaultTab.INSTALLED -> {
+                        LazyColumn(
+                            state = installedListState,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(
+                                start = 20.dp,
+                                end = 20.dp,
+                                top = 4.dp,
+                                bottom = 128.dp
+                            )
+                        ) {
+                            item(key = "installed_search") {
+                                AnimatedVisibility(
+                                    visible = searchOpen,
+                                    enter = if (reducedMotion) EnterTransition.None else (
+                                        fadeIn(tween(MotionTokens.DurationStandardMs)) +
+                                            expandVertically(animationSpec = MotionTokens.snappySpring())
+                                        ),
+                                    exit = if (reducedMotion) ExitTransition.None else (
+                                        fadeOut(tween(MotionTokens.DurationQuickMs)) +
+                                            shrinkVertically(animationSpec = MotionTokens.snappySpring())
+                                        )
+                                ) {
+                                    OutlinedTextField(
+                                        value = searchQuery,
+                                        onValueChange = { searchQuery = it },
+                                        placeholder = { Text("Filter local models...") },
+                                        singleLine = true,
+                                        leadingIcon = {
+                                            Icon(Icons.Rounded.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        },
+                                        trailingIcon = {
+                                            if (searchQuery.isNotEmpty()) {
+                                                IconButton(onClick = { searchQuery = "" }) {
+                                                    Icon(Icons.Rounded.Close, contentDescription = "Clear search", modifier = Modifier.size(18.dp))
+                                                }
+                                            }
+                                        },
+                                        shape = RoundedCornerShape(24.dp),
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedContainerColor = MaterialTheme.colorScheme.surface,
+                                            unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+                                            focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                            unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant
+                                        ),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(bottom = 16.dp)
+                                    )
+                                }
+                            }
+
+                            if (models.isEmpty()) {
+                                item(key = "empty_vault") {
+                                    EmptyVaultSection(
+                                        onImportClick = { modelPickerLauncher.launch(arrayOf("*/*")) }
+                                    )
+                                }
+                            } else {
+                                item(key = "installed_header") {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 4.dp, bottom = 8.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Installed",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = "${filteredModels.size}",
+                                            style = MaterialTheme.typography.labelMedium.tabular(),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+
+                                itemsIndexed(filteredModels, key = { _, item -> item.id }) { index, entry ->
+                                    val isLoaded = entry.id == activeModelId &&
+                                        (engineState is EngineLifecycleState.Ready ||
+                                            engineState is EngineLifecycleState.Generating)
+                                    val isLoadingThis = entry.id == activeModelId &&
+                                        engineState is EngineLifecycleState.Loading
+
+                                    Column(
+                                        modifier = Modifier.animateItem(
+                                            fadeInSpec = if (reducedMotion) null else tween(
+                                                MotionTokens.DurationStandardMs,
+                                                easing = MotionTokens.EaseOutStrong
+                                            ),
+                                            fadeOutSpec = if (reducedMotion) null else tween(MotionTokens.DurationQuickMs),
+                                            placementSpec = if (reducedMotion) null else MotionTokens.listItemSpring<IntOffset>()
+                                        )
+                                    ) {
+                                        ModelWorkspaceRow(
+                                            entry = entry,
+                                            isLoaded = isLoaded,
+                                            isLoading = isLoadingThis,
+                                            onLoadClick = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                onLoadModel(entry, false)
+                                            },
+                                            onUnloadClick = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                onUnloadModel()
+                                            },
+                                            onPairMmprojClick = {
+                                                pendingPairTargetId = entry.id
+                                                mmprojPickerLauncher.launch(arrayOf("*/*"))
+                                            },
+                                            onDeleteClick = {
+                                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                onDeleteModel(entry)
+                                            }
+                                        )
+
+                                        if (index < filteredModels.lastIndex) {
+                                            HorizontalDivider(
+                                                thickness = 0.5.dp,
+                                                color = MaterialTheme.colorScheme.outlineVariant
+                                            )
+                                        }
+                                    }
+                                }
+
+                                item(key = "add_model_footer") {
+                                    HorizontalDivider(
+                                        thickness = 0.5.dp,
+                                        color = MaterialTheme.colorScheme.outlineVariant
+                                    )
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .minimumInteractiveComponentSize()
+                                            .clickable { modelPickerLauncher.launch(arrayOf("*/*")) }
+                                            .padding(vertical = 16.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = LocalMindIcons.FolderOpen,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Text(
+                                            text = "Add Model",
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
 
-                itemsIndexed(filteredModels, key = { _, item -> item.id }) { index, entry ->
-                    val isLoaded = entry.id == activeModelId &&
-                        (engineState is EngineLifecycleState.Ready ||
-                            engineState is EngineLifecycleState.Generating)
-                    val isLoadingThis = entry.id == activeModelId &&
-                        engineState is EngineLifecycleState.Loading
-
-                    ModelWorkspaceRow(
-                        entry = entry,
-                        isLoaded = isLoaded,
-                        isLoading = isLoadingThis,
-                        onLoadClick = { onLoadModel(entry, false) },
-                        onUnloadClick = onUnloadModel,
-                        onPairMmprojClick = {
-                            pendingPairTargetId = entry.id
-                            mmprojPickerLauncher.launch(arrayOf("*/*"))
-                        },
-                        onDeleteClick = { onDeleteModel(entry) }
-                    )
-
-                    if (index < filteredModels.lastIndex) {
-                        HorizontalDivider(
-                            thickness = 0.5.dp,
-                            color = MaterialTheme.colorScheme.outlineVariant
-                        )
-                    }
-                }
-
-                // Cursor-style "Add Model" trailing row (just like "Add Workspace" in Screenshot 2)
-                item {
-                    HorizontalDivider(
-                        thickness = 0.5.dp,
-                        color = MaterialTheme.colorScheme.outlineVariant
-                    )
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .minimumInteractiveComponentSize()
-                            .clickable { modelPickerLauncher.launch(arrayOf("*/*")) }
-                            .padding(vertical = 16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.FolderOpen,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Text(
-                            text = "Add Model",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f)
-                        )
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                            modifier = Modifier.size(20.dp)
-                        )
+                    VaultTab.DISCOVER -> {
+                        LazyColumn(
+                            state = discoverListState,
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(
+                                start = 20.dp,
+                                end = 20.dp,
+                                top = 4.dp,
+                                bottom = 128.dp
+                            )
+                        ) {
+                            item(key = "discover_hub") {
+                                HubDiscoverColumn(
+                                    hubState = hubState,
+                                    downloads = hubDownloads,
+                                    memoryStats = memoryStats,
+                                    onSearchHubModels = onSearchHubModels,
+                                    onLoadRepoFiles = onLoadHubRepoFiles,
+                                    onDownloadFile = onDownloadHubFile,
+                                    onPauseDownload = onPauseHubDownload,
+                                    onCancelDownload = onCancelHubDownload
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -521,7 +566,11 @@ fun ModelManagerScreen(
                 }
 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (models.isNotEmpty()) {
+                    AnimatedVisibility(
+                        visible = pagerState.currentPage == VaultTab.INSTALLED.ordinal && models.isNotEmpty(),
+                        enter = if (reducedMotion) EnterTransition.None else fadeIn(tween(150)),
+                        exit = if (reducedMotion) ExitTransition.None else fadeOut(tween(110))
+                    ) {
                         FloatingCircleButton(
                             onClick = { searchOpen = !searchOpen },
                             icon = if (searchOpen) Icons.Rounded.Close else Icons.Rounded.Search,
@@ -618,7 +667,7 @@ fun ModelManagerScreen(
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             Icon(
-                                imageVector = Icons.Rounded.ArrowUpward,
+                                imageVector = LocalMindIcons.ArrowUpward,
                                 contentDescription = "Go to Workbench",
                                 modifier = Modifier.size(19.dp)
                             )
@@ -695,7 +744,7 @@ private fun EmptyVaultSection(onImportClick: () -> Unit) {
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
         ) {
             Icon(
-                imageVector = Icons.Rounded.FolderOpen,
+                imageVector = LocalMindIcons.FolderOpen,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier
@@ -895,7 +944,7 @@ private fun ModelWorkspaceRow(
                         horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.Visibility,
+                            imageVector = LocalMindIcons.Visibility,
                             contentDescription = null,
                             tint = if (entry.mmprojFilePath != null) {
                                 MaterialTheme.colorScheme.secondary
@@ -936,7 +985,7 @@ private fun ModelWorkspaceRow(
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.DeleteOutline,
+                        imageVector = LocalMindIcons.DeleteOutline,
                         contentDescription = stringResource(R.string.btn_delete_model),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(14.dp)

@@ -62,28 +62,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
-import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.AddPhotoAlternate
-import androidx.compose.material.icons.rounded.ArrowDownward
-import androidx.compose.material.icons.rounded.ArrowUpward
-import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Check
-import androidx.compose.material.icons.rounded.ContentCopy
-import androidx.compose.material.icons.rounded.DeleteOutline
-import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Edit
-import androidx.compose.material.icons.rounded.ExpandMore
-import androidx.compose.material.icons.rounded.Forum
-import androidx.compose.material.icons.rounded.Mic
-import androidx.compose.material.icons.rounded.MoreHoriz
-import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material.icons.rounded.Share
-import androidx.compose.material.icons.rounded.Stop
-import androidx.compose.material.icons.rounded.Tune
-import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -129,6 +112,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
@@ -146,6 +130,7 @@ import com.example.ui.components.CitationsChipRow
 import com.example.ui.components.ContextWindowGaugePill
 import com.example.ui.components.FloatingCircleButton
 import com.example.ui.components.FloatingPillButton
+import com.example.ui.components.LocalMindIcons
 import com.example.ui.components.MarkdownText
 import com.example.ui.components.PendingAttachmentCard
 import com.example.ui.components.SlashCommandPopover
@@ -476,6 +461,14 @@ fun ChatScreen(
                         onDeleteMessage = onDeleteMessage,
                         modifier = Modifier
                             .fillMaxWidth()
+                            .animateItem(
+                                fadeInSpec = if (reducedMotion) null else tween(
+                                    MotionTokens.DurationStandardMs,
+                                    easing = MotionTokens.EaseOutStrong
+                                ),
+                                fadeOutSpec = if (reducedMotion) null else tween(MotionTokens.DurationQuickMs),
+                                placementSpec = if (reducedMotion || msg.isStreaming) null else MotionTokens.listItemSpring<IntOffset>()
+                            )
                             .alpha(if (msg.isOutsideContextWindow) 0.55f else 1f)
                     )
                 }
@@ -549,7 +542,7 @@ fun ChatScreen(
                         listState.animateScrollToItem(anchorIndex)
                     }
                 },
-                icon = Icons.Rounded.ArrowDownward,
+                icon = LocalMindIcons.ArrowDownward,
                 contentDescription = stringResource(R.string.btn_jump_to_bottom),
                 modifier = Modifier.testTag("jump_to_bottom_button")
             )
@@ -808,7 +801,7 @@ private fun FloatingComposerDock(
                     modifier = Modifier.testTag("thinking_toggle_chip")
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.Psychology,
+                        imageVector = LocalMindIcons.Psychology,
                         contentDescription = stringResource(R.string.btn_toggle_thinking),
                         tint = if (enableThinking) {
                             MaterialTheme.colorScheme.tertiary
@@ -828,7 +821,7 @@ private fun FloatingComposerDock(
                     modifier = Modifier.testTag("attach_document_button")
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.Description,
+                        imageVector = LocalMindIcons.Description,
                         contentDescription = stringResource(R.string.btn_attach_document),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(16.dp)
@@ -848,7 +841,7 @@ private fun FloatingComposerDock(
                     modifier = Modifier.testTag("photo_picker_button")
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.AddPhotoAlternate,
+                        imageVector = LocalMindIcons.AddPhotoAlternate,
                         contentDescription = stringResource(R.string.btn_attach_photo),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(16.dp)
@@ -864,7 +857,7 @@ private fun FloatingComposerDock(
                     modifier = Modifier.testTag("camera_capture_button")
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.CameraAlt,
+                        imageVector = LocalMindIcons.CameraAlt,
                         contentDescription = stringResource(R.string.btn_capture_camera),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(16.dp)
@@ -941,7 +934,7 @@ private fun FloatingComposerDock(
                         ) {
                             DropdownMenuItem(
                                 text = { Text("Attach Document (PDF / TXT)") },
-                                leadingIcon = { Icon(Icons.Rounded.Description, contentDescription = null) },
+                                leadingIcon = { Icon(LocalMindIcons.Description, contentDescription = null) },
                                 onClick = {
                                     showComposerMenu = false
                                     launchDocumentPicker()
@@ -949,7 +942,7 @@ private fun FloatingComposerDock(
                             )
                             DropdownMenuItem(
                                 text = { Text("Attach Photo") },
-                                leadingIcon = { Icon(Icons.Rounded.AddPhotoAlternate, contentDescription = null) },
+                                leadingIcon = { Icon(LocalMindIcons.AddPhotoAlternate, contentDescription = null) },
                                 onClick = {
                                     showComposerMenu = false
                                     photoPickerLauncher.launch(
@@ -959,7 +952,7 @@ private fun FloatingComposerDock(
                             )
                             DropdownMenuItem(
                                 text = { Text("Capture Photo") },
-                                leadingIcon = { Icon(Icons.Rounded.CameraAlt, contentDescription = null) },
+                                leadingIcon = { Icon(LocalMindIcons.CameraAlt, contentDescription = null) },
                                 onClick = {
                                     showComposerMenu = false
                                     onOpenCamera()
@@ -975,7 +968,7 @@ private fun FloatingComposerDock(
                             )
                             DropdownMenuItem(
                                 text = { Text("Customize & Telemetry") },
-                                leadingIcon = { Icon(Icons.Rounded.Tune, contentDescription = null) },
+                                leadingIcon = { Icon(LocalMindIcons.Tune, contentDescription = null) },
                                 onClick = {
                                     showComposerMenu = false
                                     onOpenTelemetrySheet()
@@ -1058,7 +1051,10 @@ private fun FloatingComposerDock(
                         when (mode) {
                             ComposerActionMode.STOP -> {
                                 Surface(
-                                    onClick = onStopGeneration,
+                                    onClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        onStopGeneration()
+                                    },
                                     interactionSource = stopInteraction,
                                     shape = CircleShape,
                                     color = MaterialTheme.colorScheme.primary,
@@ -1071,7 +1067,7 @@ private fun FloatingComposerDock(
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Icon(
-                                            imageVector = Icons.Rounded.Stop,
+                                            imageVector = LocalMindIcons.Stop,
                                             contentDescription = stringResource(R.string.btn_stop_generation),
                                             modifier = Modifier.size(20.dp)
                                         )
@@ -1116,7 +1112,7 @@ private fun FloatingComposerDock(
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Icon(
-                                            imageVector = if (isListening) Icons.Rounded.Stop else Icons.Rounded.Mic,
+                                            imageVector = if (isListening) LocalMindIcons.Stop else LocalMindIcons.Mic,
                                             contentDescription = if (isListening) {
                                                 stringResource(R.string.btn_stop_dictate)
                                             } else {
@@ -1158,7 +1154,7 @@ private fun FloatingComposerDock(
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Icon(
-                                            imageVector = Icons.Rounded.ArrowUpward,
+                                            imageVector = LocalMindIcons.ArrowUpward,
                                             contentDescription = stringResource(R.string.btn_send_prompt),
                                             modifier = Modifier.size(20.dp)
                                         )
@@ -1207,7 +1203,7 @@ private fun LowMemoryWarningBanner(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Rounded.WarningAmber,
+                        imageVector = LocalMindIcons.WarningAmber,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.tertiary,
                         modifier = Modifier.size(18.dp)
@@ -1288,6 +1284,7 @@ private fun FloatingThreadTopBar(
     onOpenTelemetrySheet: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val haptics = LocalHapticFeedback.current
     val reducedMotion = rememberPrefersReducedMotion()
     val semantic = LocalSemanticColors.current
     val isLive = engineState is EngineLifecycleState.Generating || engineState is EngineLifecycleState.Loading
@@ -1337,8 +1334,11 @@ private fun FloatingThreadTopBar(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 FloatingCircleButton(
-                    onClick = onOpenThreadsHub,
-                    icon = Icons.Rounded.Forum,
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onOpenThreadsHub()
+                    },
+                    icon = LocalMindIcons.Forum,
                     contentDescription = stringResource(R.string.btn_open_threads),
                     iconSize = 20.dp,
                     modifier = Modifier.testTag("nav_threads")
@@ -1346,7 +1346,10 @@ private fun FloatingThreadTopBar(
 
                 // Center floating active model / Vault pill
                 Surface(
-                    onClick = onOpenModelVault,
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onOpenModelVault()
+                    },
                     interactionSource = selectorInteraction,
                     shape = RoundedCornerShape(24.dp),
                     color = semantic.floatingSurface,
@@ -1408,7 +1411,10 @@ private fun FloatingThreadTopBar(
                 }
 
                 FloatingCircleButton(
-                    onClick = onResetConversation,
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onResetConversation()
+                    },
                     icon = Icons.Rounded.Refresh,
                     contentDescription = stringResource(R.string.btn_reset_session),
                     iconSize = 19.dp,
@@ -1416,8 +1422,11 @@ private fun FloatingThreadTopBar(
                 )
 
                 FloatingCircleButton(
-                    onClick = onOpenTelemetrySheet,
-                    icon = Icons.Rounded.MoreHoriz,
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onOpenTelemetrySheet()
+                    },
+                    icon = LocalMindIcons.MoreHoriz,
                     contentDescription = stringResource(R.string.btn_telemetry),
                     iconSize = 20.dp,
                     modifier = Modifier.testTag("telemetry_button")
@@ -1853,7 +1862,7 @@ private fun MessageActionRow(
                 .testTag("copy_message_button")
         ) {
             Icon(
-                imageVector = if (justCopied) Icons.Rounded.Check else Icons.Rounded.ContentCopy,
+                imageVector = if (justCopied) Icons.Rounded.Check else LocalMindIcons.ContentCopy,
                 contentDescription = stringResource(R.string.btn_copy_message),
                 tint = if (justCopied) LocalSemanticColors.current.liveEmerald else iconTint,
                 modifier = Modifier.size(17.dp)
@@ -1870,7 +1879,7 @@ private fun MessageActionRow(
                     .testTag("read_aloud_button")
             ) {
                 Icon(
-                    imageVector = if (isSpeakingThis) Icons.Rounded.Stop else Icons.AutoMirrored.Rounded.VolumeUp,
+                    imageVector = if (isSpeakingThis) LocalMindIcons.Stop else LocalMindIcons.VolumeUp,
                     contentDescription = if (isSpeakingThis) {
                         stringResource(R.string.btn_stop_speaking)
                     } else {
@@ -1910,7 +1919,7 @@ private fun MessageActionRow(
                     .testTag("regenerate_button")
             ) {
                 Icon(
-                    imageVector = Icons.Rounded.Replay,
+                    imageVector = LocalMindIcons.Replay,
                     contentDescription = stringResource(R.string.btn_regenerate),
                     tint = iconTint,
                     modifier = Modifier.size(17.dp)
@@ -1936,7 +1945,7 @@ private fun MessageActionRow(
                 .testTag("delete_message_button")
         ) {
             Icon(
-                imageVector = Icons.Rounded.DeleteOutline,
+                imageVector = LocalMindIcons.DeleteOutline,
                 contentDescription = stringResource(R.string.btn_delete_message),
                 tint = iconTint,
                 modifier = Modifier.size(17.dp)
@@ -1953,6 +1962,7 @@ private fun ThinkingProcessCard(
     thoughtTokens: Int,
     keepExpandedOnEmptyAnswer: Boolean = false
 ) {
+    val haptics = LocalHapticFeedback.current
     val reducedMotion = rememberPrefersReducedMotion()
     var expanded by rememberSaveable(messageId) { mutableStateOf(isThinking || keepExpandedOnEmptyAnswer) }
     LaunchedEffect(isThinking, keepExpandedOnEmptyAnswer) {
@@ -1963,7 +1973,7 @@ private fun ThinkingProcessCard(
 
     val chevronRotation by animateFloatAsState(
         targetValue = if (expanded) 180f else 0f,
-        animationSpec = if (reducedMotion) tween(0) else tween(200, easing = MotionTokens.EaseInOutStrong),
+        animationSpec = if (reducedMotion) tween(0) else MotionTokens.tactileSpring(),
         label = "thinkingChevron"
     )
 
@@ -1976,7 +1986,10 @@ private fun ThinkingProcessCard(
             modifier = Modifier
                 .defaultMinSize(minHeight = 48.dp)
                 .clip(RoundedCornerShape(10.dp))
-                .clickable { expanded = !expanded }
+                .clickable {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    expanded = !expanded
+                }
                 .padding(vertical = 8.dp, horizontal = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -2000,7 +2013,7 @@ private fun ThinkingProcessCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Icon(
-                imageVector = Icons.Rounded.ExpandMore,
+                imageVector = LocalMindIcons.ExpandMore,
                 contentDescription = if (expanded) "Collapse thought process" else "Expand thought process",
                 tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                 modifier = Modifier
@@ -2012,12 +2025,12 @@ private fun ThinkingProcessCard(
         AnimatedVisibility(
             visible = expanded && thinkingText.isNotBlank(),
             enter = if (reducedMotion) EnterTransition.None else (
-                fadeIn(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong)) +
-                    expandVertically(tween(MotionTokens.DurationPanelMs, easing = MotionTokens.EaseOutStrong))
+                fadeIn(tween(MotionTokens.DurationQuickMs, easing = MotionTokens.EaseOutStrong)) +
+                    expandVertically(animationSpec = MotionTokens.snappySpring())
                 ),
             exit = if (reducedMotion) ExitTransition.None else (
-                fadeOut(tween(MotionTokens.DurationQuickMs)) +
-                    shrinkVertically(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong))
+                fadeOut(tween(110)) +
+                    shrinkVertically(animationSpec = MotionTokens.snappySpring())
                 )
         ) {
             Row(

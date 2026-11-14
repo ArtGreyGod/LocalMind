@@ -473,6 +473,8 @@ class ExampleRobolectricTest {
         composeRule.onNodeWithTag("import_model_fab").assertExists()
         composeRule.onNodeWithTag("vault_tab_discover").performClick()
         composeRule.onNodeWithTag("hub_search_input").assertExists()
+        composeRule.onNodeWithTag("vault_tab_installed").performClick()
+        composeRule.onNodeWithTag("model_card_qwen35").assertExists()
     }
 
     @Test
@@ -516,6 +518,8 @@ class ExampleRobolectricTest {
         composeRule.onNodeWithTag("hub_tab_workspaces").performClick()
         composeRule.onNodeWithTag("workspace_row_workspace_general").assertExists()
         composeRule.onNodeWithTag("add_workspace_row").assertExists()
+        composeRule.onNodeWithTag("hub_tab_threads").performClick()
+        composeRule.onNodeWithTag("thread_row_t1").assertExists()
     }
 
     @Test
@@ -712,7 +716,56 @@ class ExampleRobolectricTest {
         }
         composeRule.onNodeWithTag("interrupted_badge").assertExists()
         composeRule.onNodeWithTag("low_memory_warning_banner").assertExists()
+        composeRule.onNodeWithTag("thinking_block").performClick()
         composeRule.onNodeWithTag("memory_warning_dismiss_button").performClick()
         assertTrue(dismissed)
+    }
+
+    @Test
+    fun `curated LocalMindIcons vectors instantiate with valid 24dp bounds`() {
+        val icons = listOf(
+            com.example.ui.components.LocalMindIcons.AddPhotoAlternate,
+            com.example.ui.components.LocalMindIcons.Archive,
+            com.example.ui.components.LocalMindIcons.ArrowDownward,
+            com.example.ui.components.LocalMindIcons.ArrowUpward,
+            com.example.ui.components.LocalMindIcons.AutoAwesome,
+            com.example.ui.components.LocalMindIcons.Bedtime,
+            com.example.ui.components.LocalMindIcons.CameraAlt,
+            com.example.ui.components.LocalMindIcons.ChatBubble,
+            com.example.ui.components.LocalMindIcons.ChatBubbleOutline,
+            com.example.ui.components.LocalMindIcons.CloudDownload,
+            com.example.ui.components.LocalMindIcons.ContentCopy,
+            com.example.ui.components.LocalMindIcons.ContentCut,
+            com.example.ui.components.LocalMindIcons.CreateNewFolder,
+            com.example.ui.components.LocalMindIcons.DeleteOutline,
+            com.example.ui.components.LocalMindIcons.Description,
+            com.example.ui.components.LocalMindIcons.ExpandLess,
+            com.example.ui.components.LocalMindIcons.ExpandMore,
+            com.example.ui.components.LocalMindIcons.FolderOpen,
+            com.example.ui.components.LocalMindIcons.Forum,
+            com.example.ui.components.LocalMindIcons.ForumOutlined,
+            com.example.ui.components.LocalMindIcons.GraphicEq,
+            com.example.ui.components.LocalMindIcons.Memory,
+            com.example.ui.components.LocalMindIcons.Mic,
+            com.example.ui.components.LocalMindIcons.MoreHoriz,
+            com.example.ui.components.LocalMindIcons.Palette,
+            com.example.ui.components.LocalMindIcons.Pause,
+            com.example.ui.components.LocalMindIcons.Psychology,
+            com.example.ui.components.LocalMindIcons.PushPin,
+            com.example.ui.components.LocalMindIcons.Replay,
+            com.example.ui.components.LocalMindIcons.Stop,
+            com.example.ui.components.LocalMindIcons.Storage,
+            com.example.ui.components.LocalMindIcons.StorageOutlined,
+            com.example.ui.components.LocalMindIcons.Tune,
+            com.example.ui.components.LocalMindIcons.Unarchive,
+            com.example.ui.components.LocalMindIcons.Visibility,
+            com.example.ui.components.LocalMindIcons.VolumeUp,
+            com.example.ui.components.LocalMindIcons.WarningAmber
+        )
+        assertEquals(37, icons.size)
+        icons.forEach { icon ->
+            assertEquals(24f, icon.viewportWidth, 0.01f)
+            assertEquals(24f, icon.viewportHeight, 0.01f)
+        }
     }
 }

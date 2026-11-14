@@ -22,16 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.AutoAwesome
-import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.ContentCut
-import androidx.compose.material.icons.rounded.DeleteOutline
-import androidx.compose.material.icons.rounded.Memory
-import androidx.compose.material.icons.rounded.Palette
-import androidx.compose.material.icons.rounded.Psychology
-import androidx.compose.material.icons.rounded.Speed
-import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -190,7 +181,7 @@ fun TelemetryAndTuningSheet(
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Rounded.Memory,
+                                        imageVector = LocalMindIcons.Memory,
                                         contentDescription = null,
                                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.size(18.dp)
@@ -330,7 +321,7 @@ fun TelemetryAndTuningSheet(
                                 .testTag("trim_context_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Rounded.ContentCut,
+                                imageVector = LocalMindIcons.ContentCut,
                                 contentDescription = null,
                                 modifier = Modifier.size(16.dp)
                             )
@@ -347,7 +338,7 @@ fun TelemetryAndTuningSheet(
                     SectionCaption(text = "Reasoning")
                     Spacer(modifier = Modifier.height(6.dp))
                     CustomizeSwitchRow(
-                        icon = Icons.Rounded.Psychology,
+                        icon = LocalMindIcons.Psychology,
                         title = "Thinking Mode",
                         subtitle = "Step-by-step thought stream before final response",
                         checked = tuning.enableThinking,
@@ -396,7 +387,7 @@ fun TelemetryAndTuningSheet(
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.Palette,
+                            imageVector = LocalMindIcons.Palette,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(20.dp)
@@ -425,7 +416,7 @@ fun TelemetryAndTuningSheet(
                     }
                     Hairline()
                     CustomizeSwitchRow(
-                        icon = Icons.Rounded.Bedtime,
+                        icon = LocalMindIcons.Bedtime,
                         title = "Keep Screen Awake",
                         subtitle = "Prevent sleep while generating tokens",
                         checked = keepScreenOnDuringInference,
@@ -435,7 +426,7 @@ fun TelemetryAndTuningSheet(
                     )
                     Hairline()
                     CustomizeSwitchRow(
-                        icon = Icons.Rounded.AutoAwesome,
+                        icon = LocalMindIcons.AutoAwesome,
                         title = "Auto-Load Last Model",
                         subtitle = "Restore previous weights on launch if RAM allows",
                         checked = autoLoadLastModel,
@@ -497,7 +488,7 @@ fun TelemetryAndTuningSheet(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.Tune,
+                            imageVector = LocalMindIcons.Tune,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(16.dp)
@@ -913,7 +904,7 @@ private fun SlashTemplatesCustomizeSection(
                         modifier = Modifier.size(36.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.DeleteOutline,
+                            imageVector = LocalMindIcons.DeleteOutline,
                             contentDescription = "Delete template",
                             modifier = Modifier.size(18.dp)
                         )
