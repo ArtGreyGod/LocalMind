@@ -1,5 +1,7 @@
 package com.example.ui.viewmodel
 
+import androidx.compose.runtime.Immutable
+import com.example.data.engine.MemoryPressureWarning
 import com.example.data.hub.HfModelFile
 import com.example.data.hub.HfRepoSummary
 import com.example.data.local.DocumentCitationUi
@@ -17,6 +19,7 @@ enum class ChatRole {
     ASSISTANT
 }
 
+@Immutable
 data class ChatMessageUi(
     val id: String = UUID.randomUUID().toString(),
     val role: ChatRole,
@@ -25,6 +28,7 @@ data class ChatMessageUi(
     val isThinking: Boolean = false,
     val imageUriString: String? = null,
     val isStreaming: Boolean = false,
+    val isInterrupted: Boolean = false,
     val telemetry: GenerationTelemetry? = null,
     val timestampMillis: Long = System.currentTimeMillis(),
     val turnOrder: Int = 0,
@@ -35,6 +39,7 @@ data class ChatMessageUi(
     val isOutsideContextWindow: Boolean = false
 )
 
+@Immutable
 data class InferenceTuningConfig(
     val preferredAccelerator: HardwareAccelerator = HardwareAccelerator.NPU,
     val contextLength: Int = 4096,
@@ -49,11 +54,13 @@ data class InferenceTuningConfig(
     val systemPrompt: String = "You are LocalMind, a helpful, accurate on-device AI assistant."
 )
 
+@Immutable
 data class PendingPreflightWarning(
     val model: LocalModelEntry,
     val preflight: RamPreflightResult
 )
 
+@Immutable
 data class HubBrowserState(
     val query: String = "",
     val isSearching: Boolean = false,
@@ -63,6 +70,7 @@ data class HubBrowserState(
     val errorMessage: String? = null
 )
 
+@Immutable
 data class LocalMindUiState(
     val activeThreadId: String? = null,
     val activeThreadTitle: String = "New Thread",
@@ -81,6 +89,7 @@ data class LocalMindUiState(
     val autoLoadLastModel: Boolean = true,
     val keepScreenOnDuringInference: Boolean = true,
     val memoryStats: MemoryStats? = null,
+    val memoryPressureWarning: MemoryPressureWarning? = null,
     val pendingPreflightWarning: PendingPreflightWarning? = null,
     val statusBanner: String? = null
 )

@@ -330,7 +330,10 @@ fun LocalMindRootScreen(
                                 onStartVoiceDictation = viewModel::startVoiceDictation,
                                 onStopVoiceDictation = viewModel::stopVoiceDictation,
                                 onToggleReadAloud = viewModel::toggleReadAloud,
-                                onOpenThreadsHub = { navigateToRoute(ThreadsRoute) }
+                                onOpenThreadsHub = { navigateToRoute(ThreadsRoute) },
+                                onDismissMemoryWarning = viewModel::dismissMemoryPressureWarning,
+                                onTrimContextFromMemoryWarning = viewModel::trimContextFromMemoryWarning,
+                                onUnloadFromMemoryWarning = viewModel::unloadFromMemoryWarning
                             )
                         }
 

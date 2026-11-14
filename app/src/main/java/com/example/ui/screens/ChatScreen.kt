@@ -83,6 +83,7 @@ import androidx.compose.material.icons.rounded.Replay
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -100,8 +101,10 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -130,6 +133,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import com.example.R
+import com.example.data.engine.MemoryPressureWarning
 import com.example.data.local.DocumentCitationUi
 import com.example.data.local.IndexedDocumentEntity
 import com.example.data.local.SlashCommandItem
@@ -189,7 +193,10 @@ fun ChatScreen(
     onStartVoiceDictation: ((String) -> Unit) -> Unit = {},
     onStopVoiceDictation: () -> Unit = {},
     onToggleReadAloud: (String, String) -> Unit = { _, _ -> },
-    onOpenThreadsHub: () -> Unit = {}
+    onOpenThreadsHub: () -> Unit = {},
+    onDismissMemoryWarning: () -> Unit = {},
+    onTrimContextFromMemoryWarning: () -> Unit = {},
+    onUnloadFromMemoryWarning: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
@@ -198,62 +205,23 @@ fun ChatScreen(
     val reducedMotion = rememberPrefersReducedMotion()
     val semantic = LocalSemanticColors.current
 
-    var promptInput by rememberSaveable { mutableStateOf("") }
+    // Kept as MutableState without reading .value here so typing isolates FloatingComposerDock recomposition
+    val promptInputState = rememberSaveable { mutableStateOf("") }
     var showCameraDialog by rememberSaveable { mutableStateOf(false) }
-    var showComposerMenu by remember { mutableStateOf(false) }
     var editingPromptText by rememberSaveable { mutableStateOf<String?>(null) }
     var showTrimConfirmDialog by rememberSaveable { mutableStateOf(false) }
     var inspectingCitation by remember { mutableStateOf<DocumentCitationUi?>(null) }
-
-    val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) onAttachImageUri(uri)
-    }
-
-    val documentPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri != null) onAttachDocumentUri(uri)
-    }
-
-    val appendDictatedText: (String) -> Unit = { spoken ->
-        promptInput = if (promptInput.isBlank()) spoken else "${promptInput.trimEnd()} $spoken"
-    }
-
-    val audioPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            onStartVoiceDictation(appendDictatedText)
-        } else {
-            onShowStatusBanner("Microphone permission is required for offline voice dictation.")
-        }
-    }
-
-    val launchDocumentPicker = {
-        documentPickerLauncher.launch(
-            arrayOf("application/pdf", "text/*", "application/json")
-        )
-    }
 
     val listState = rememberLazyListState()
     val isAtBottom by remember {
         derivedStateOf {
             val layoutInfo = listState.layoutInfo
             val total = layoutInfo.totalItemsCount
-            if (total == 0) true
+            if (total <= 1) true
             else {
                 val lastVisible = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-                lastVisible >= total - 1
+                lastVisible >= total - 2
             }
-        }
-    }
-
-    val lastMsg = uiState.messages.lastOrNull()
-    LaunchedEffect(uiState.messages.size, lastMsg?.text?.length, lastMsg?.thinkingText?.length) {
-        if (uiState.messages.isNotEmpty() && isAtBottom) {
-            listState.animateScrollToItem(uiState.messages.lastIndex)
         }
     }
 
@@ -261,27 +229,38 @@ fun ChatScreen(
     val isLoading = engineState is EngineLifecycleState.Loading
     val isReady = engineState is EngineLifecycleState.Ready
 
-    val matchingSlashCommands = remember(promptInput, slashCommands) {
-        if (!promptInput.startsWith("/")) emptyList()
-        else {
-            val filter = promptInput.removePrefix("/").substringBefore(' ').trim().lowercase()
-            slashCommands.filter {
-                filter.isEmpty() || it.trigger.lowercase().contains(filter) || it.label.lowercase().contains(filter)
+    val lastMsg = uiState.messages.lastOrNull()
+    val anchorIndex = uiState.messages.size
+    var previousMessageCount by remember { mutableIntStateOf(uiState.messages.size) }
+    LaunchedEffect(anchorIndex, lastMsg?.text?.length, lastMsg?.thinkingText?.length) {
+        val countIncreased = anchorIndex > previousMessageCount
+        previousMessageCount = anchorIndex
+        if (uiState.messages.isNotEmpty() &&
+            isAtBottom &&
+            !listState.isScrollInProgress &&
+            listState.layoutInfo.totalItemsCount > anchorIndex
+        ) {
+            if (isGenerating || lastMsg?.isStreaming == true) {
+                listState.scrollToItem(anchorIndex)
+            } else if (countIncreased) {
+                listState.animateScrollToItem(anchorIndex)
             }
         }
     }
 
-    val exportAction: () -> Unit = {
-        val md = onBuildMarkdownTranscript()
-        clipboard.setText(AnnotatedString(md))
-        val sendIntent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/markdown"
-            putExtra(Intent.EXTRA_SUBJECT, "LocalMind Chat Transcript")
-            putExtra(Intent.EXTRA_TEXT, md)
+    val exportAction = remember(onBuildMarkdownTranscript, onShowStatusBanner) {
+        {
+            val md = onBuildMarkdownTranscript()
+            clipboard.setText(AnnotatedString(md))
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/markdown"
+                putExtra(Intent.EXTRA_SUBJECT, "LocalMind Chat Transcript")
+                putExtra(Intent.EXTRA_TEXT, md)
+            }
+            val chooser = Intent.createChooser(sendIntent, "Export Markdown Transcript")
+            runCatching { context.startActivity(chooser) }
+            onShowStatusBanner("Markdown transcript copied & ready to share")
         }
-        val chooser = Intent.createChooser(sendIntent, "Export Markdown Transcript")
-        runCatching { context.startActivity(chooser) }
-        onShowStatusBanner("Markdown transcript copied & ready to share")
     }
 
     DisposableEffect(isGenerating, uiState.keepScreenOnDuringInference) {
@@ -409,12 +388,26 @@ fun ChatScreen(
             .background(MaterialTheme.colorScheme.background)
             .imePadding()
     ) {
+        val copyMessageStable = remember(clipboard, haptics, onShowStatusBanner) {
+            { content: String ->
+                clipboard.setText(AnnotatedString(content))
+                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onShowStatusBanner("Message copied")
+            }
+        }
+        val inspectCitationStable = remember {
+            { cit: DocumentCitationUi -> inspectingCitation = cit }
+        }
+        val editPromptStable = remember {
+            { originalText: String -> editingPromptText = originalText }
+        }
+
         if (uiState.messages.isEmpty()) {
             WorkbenchEmptyState(
                 isModelLoaded = isReady || isGenerating,
                 activeModel = activeModel,
                 onOpenModelVault = onOpenModelVault,
-                onPickSuggestion = { suggestion -> promptInput = suggestion },
+                onPickSuggestion = { suggestion -> promptInputState.value = suggestion },
                 modifier = Modifier
                     .fillMaxSize()
                     .statusBarsPadding()
@@ -436,7 +429,11 @@ fun ChatScreen(
                 ),
                 verticalArrangement = Arrangement.spacedBy(22.dp)
             ) {
-                itemsIndexed(uiState.messages, key = { _, msg -> msg.id }) { index, msg ->
+                itemsIndexed(
+                    items = uiState.messages,
+                    key = { _, msg -> msg.id },
+                    contentType = { _, msg -> msg.role }
+                ) { index, msg ->
                     val prevMsg = if (index > 0) uiState.messages[index - 1] else null
                     val showTrimBoundary = prevMsg?.isOutsideContextWindow == true && !msg.isOutsideContextWindow
 
@@ -470,45 +467,62 @@ fun ChatScreen(
                         canRegenerate = canRegenerate,
                         canEditPrompt = canEditPrompt,
                         isSpeakingThis = speakingMessageId == msg.id,
-                        onCopyMessage = { content ->
-                            clipboard.setText(AnnotatedString(content))
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onShowStatusBanner("Message copied")
-                        },
-                        onToggleReadAloud = {
-                            onToggleReadAloud(msg.id, msg.text.ifEmpty { msg.thinkingText })
-                        },
-                        onSelectBranch = { targetId ->
-                            onSelectBranch(msg.branchGroupId, targetId)
-                        },
-                        onInspectCitation = { cit -> inspectingCitation = cit },
+                        onCopyMessage = copyMessageStable,
+                        onToggleReadAloud = onToggleReadAloud,
+                        onSelectBranch = onSelectBranch,
+                        onInspectCitation = inspectCitationStable,
                         onRegenerate = onRegenerateLastResponse,
-                        onEditPrompt = { editingPromptText = msg.text },
-                        onDeleteMessage = { onDeleteMessage(msg.id) },
+                        onEditPrompt = editPromptStable,
+                        onDeleteMessage = onDeleteMessage,
                         modifier = Modifier
                             .fillMaxWidth()
                             .alpha(if (msg.isOutsideContextWindow) 0.55f else 1f)
                     )
                 }
+
+                item(key = "bottom_anchor", contentType = "anchor") {
+                    Spacer(modifier = Modifier.height(1.dp))
+                }
             }
         }
 
-        // Layer 2: Floating Top Bar + Workspace / Context Window Gauge sub-row
-        FloatingThreadTopBar(
-            engineState = engineState,
-            activeModel = activeModel,
-            workspaceName = uiState.activeWorkspaceName,
-            liveDecodeTokPerSec = uiState.liveDecodeTokensPerSec,
-            contextUsedTokens = activeContextUsed,
-            contextMaxTokens = activeContextMax,
-            canTrimContext = canTrimContext,
-            onTrimContextClick = { showTrimConfirmDialog = true },
-            onOpenThreadsHub = onOpenThreadsHub,
-            onOpenModelVault = onOpenModelVault,
-            onResetConversation = onResetConversation,
-            onOpenTelemetrySheet = onOpenTelemetrySheet,
-            modifier = Modifier.align(Alignment.TopCenter)
-        )
+        // Layer 2: Floating Top Bar + Workspace / Context Window Gauge + Warn-First Low-Memory Banner
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .fillMaxWidth()
+        ) {
+            FloatingThreadTopBar(
+                engineState = engineState,
+                activeModel = activeModel,
+                workspaceName = uiState.activeWorkspaceName,
+                liveDecodeTokPerSec = uiState.liveDecodeTokensPerSec,
+                contextUsedTokens = activeContextUsed,
+                contextMaxTokens = activeContextMax,
+                canTrimContext = canTrimContext,
+                onTrimContextClick = { showTrimConfirmDialog = true },
+                onOpenThreadsHub = onOpenThreadsHub,
+                onOpenModelVault = onOpenModelVault,
+                onResetConversation = onResetConversation,
+                onOpenTelemetrySheet = onOpenTelemetrySheet
+            )
+
+            AnimatedVisibility(
+                visible = uiState.memoryPressureWarning != null,
+                enter = if (reducedMotion) EnterTransition.None else (fadeIn(tween(150)) + expandVertically()),
+                exit = if (reducedMotion) ExitTransition.None else (fadeOut(tween(110)) + shrinkVertically())
+            ) {
+                uiState.memoryPressureWarning?.let { warning ->
+                    LowMemoryWarningBanner(
+                        warning = warning,
+                        canTrimContext = canTrimContext,
+                        onTrimContext = onTrimContextFromMemoryWarning,
+                        onUnloadModel = onUnloadFromMemoryWarning,
+                        onDismiss = onDismissMemoryWarning
+                    )
+                }
+            }
+        }
 
         // Layer 3: Jump to bottom floating pill
         AnimatedVisibility(
@@ -532,7 +546,7 @@ fun ChatScreen(
             FloatingCircleButton(
                 onClick = {
                     coroutineScope.launch {
-                        listState.animateScrollToItem(uiState.messages.lastIndex)
+                        listState.animateScrollToItem(anchorIndex)
                     }
                 },
                 icon = Icons.Rounded.ArrowDownward,
@@ -541,498 +555,710 @@ fun ChatScreen(
             )
         }
 
-        // Layer 4: Bottom scrim + Slash Popover + Voice + Docs/Images + Pills + Capsule Composer
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color.Transparent,
-                            MaterialTheme.colorScheme.background.copy(alpha = 0.94f),
-                            MaterialTheme.colorScheme.background
-                        )
+        // Layer 4: Isolated Floating Composer Dock so typing never recomposes the LazyColumn
+        FloatingComposerDock(
+            promptInputState = promptInputState,
+            hasMessages = uiState.messages.isNotEmpty(),
+            isGenerating = isGenerating,
+            isLoading = isLoading,
+            isReady = isReady,
+            loadingStage = (engineState as? EngineLifecycleState.Loading)?.stage,
+            isThinkingStream = lastMsg?.isThinking == true,
+            isPreparingImage = uiState.isPreparingImage,
+            isIndexingDocument = uiState.isIndexingDocument,
+            pendingImage = uiState.pendingImage,
+            enableThinking = uiState.tuning.enableThinking,
+            activeModelVisionCapable = activeModel == null || activeModel.isVisionCapable,
+            attachedDocuments = attachedDocuments,
+            slashCommands = slashCommands,
+            isListening = isListening,
+            partialTranscript = partialTranscript,
+            onSendPrompt = onSendPrompt,
+            onStopGeneration = onStopGeneration,
+            onToggleThinking = onToggleThinking,
+            onAttachImageUri = onAttachImageUri,
+            onClearPendingImage = onClearPendingImage,
+            onAttachDocumentUri = onAttachDocumentUri,
+            onRemoveDocument = onRemoveDocument,
+            onExecuteSlashAction = onExecuteSlashAction,
+            onStartVoiceDictation = onStartVoiceDictation,
+            onStopVoiceDictation = onStopVoiceDictation,
+            onOpenCamera = { showCameraDialog = true },
+            onOpenTelemetrySheet = onOpenTelemetrySheet,
+            onExportMarkdown = exportAction,
+            onResetConversation = onResetConversation,
+            onShowStatusBanner = onShowStatusBanner,
+            modifier = Modifier.align(Alignment.BottomCenter)
+        )
+    }
+}
+
+@Composable
+private fun FloatingComposerDock(
+    promptInputState: MutableState<String>,
+    hasMessages: Boolean,
+    isGenerating: Boolean,
+    isLoading: Boolean,
+    isReady: Boolean,
+    loadingStage: String?,
+    isThinkingStream: Boolean,
+    isPreparingImage: Boolean,
+    isIndexingDocument: Boolean,
+    pendingImage: com.example.domain.engine.PreparedImage?,
+    enableThinking: Boolean,
+    activeModelVisionCapable: Boolean,
+    attachedDocuments: List<IndexedDocumentEntity>,
+    slashCommands: List<SlashCommandItem>,
+    isListening: Boolean,
+    partialTranscript: String,
+    onSendPrompt: (String) -> Unit,
+    onStopGeneration: () -> Unit,
+    onToggleThinking: () -> Unit,
+    onAttachImageUri: (Uri) -> Unit,
+    onClearPendingImage: () -> Unit,
+    onAttachDocumentUri: (Uri) -> Unit,
+    onRemoveDocument: (String) -> Unit,
+    onExecuteSlashAction: (String) -> Unit,
+    onStartVoiceDictation: ((String) -> Unit) -> Unit,
+    onStopVoiceDictation: () -> Unit,
+    onOpenCamera: () -> Unit,
+    onOpenTelemetrySheet: () -> Unit,
+    onExportMarkdown: () -> Unit,
+    onResetConversation: () -> Unit,
+    onShowStatusBanner: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val haptics = LocalHapticFeedback.current
+    val reducedMotion = rememberPrefersReducedMotion()
+    val semantic = LocalSemanticColors.current
+
+    var promptInput by promptInputState
+    var showComposerMenu by remember { mutableStateOf(false) }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) onAttachImageUri(uri)
+    }
+
+    val documentPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) onAttachDocumentUri(uri)
+    }
+
+    val appendDictatedText: (String) -> Unit = { spoken ->
+        promptInput = if (promptInput.isBlank()) spoken else "${promptInput.trimEnd()} $spoken"
+    }
+
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            onStartVoiceDictation(appendDictatedText)
+        } else {
+            onShowStatusBanner("Microphone permission is required for offline voice dictation.")
+        }
+    }
+
+    val launchDocumentPicker = {
+        documentPickerLauncher.launch(
+            arrayOf("application/pdf", "text/*", "application/json")
+        )
+    }
+
+    val matchingSlashCommands = remember(promptInput, slashCommands) {
+        if (!promptInput.startsWith("/")) emptyList()
+        else {
+            val filter = promptInput.removePrefix("/").substringBefore(' ').trim().lowercase()
+            slashCommands.filter {
+                filter.isEmpty() || it.trigger.lowercase().contains(filter) || it.label.lowercase().contains(filter)
+            }
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color.Transparent,
+                        MaterialTheme.colorScheme.background.copy(alpha = 0.94f),
+                        MaterialTheme.colorScheme.background
                     )
                 )
-                .navigationBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp)
+            )
+            .navigationBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .widthIn(max = 720.dp)
+                .align(Alignment.Center)
+                .fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .widthIn(max = 720.dp)
-                    .align(Alignment.Center)
-                    .fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+            AnimatedVisibility(
+                visible = matchingSlashCommands.isNotEmpty(),
+                enter = fadeIn(tween(120)) + expandVertically(),
+                exit = fadeOut(tween(100)) + shrinkVertically()
             ) {
-                AnimatedVisibility(
-                    visible = matchingSlashCommands.isNotEmpty(),
-                    enter = fadeIn(tween(120)) + expandVertically(),
-                    exit = fadeOut(tween(100)) + shrinkVertically()
-                ) {
-                    SlashCommandPopover(
-                        commands = matchingSlashCommands,
-                        onSelectCommand = { cmd ->
-                            if (cmd.isActionCommand) {
-                                promptInput = ""
-                                onExecuteSlashAction(cmd.id)
-                            } else {
-                                promptInput = cmd.promptBody
-                            }
-                        }
-                    )
-                }
-
-                AnimatedVisibility(
-                    visible = isListening,
-                    enter = fadeIn(tween(120)) + expandVertically(),
-                    exit = fadeOut(tween(100)) + shrinkVertically()
-                ) {
-                    VoiceListeningBanner(
-                        partialTranscript = partialTranscript,
-                        onStopDictation = onStopVoiceDictation
-                    )
-                }
-
-                AnimatedVisibility(
-                    visible = isGenerating || isLoading || uiState.isPreparingImage,
-                    enter = fadeIn(tween(140)) + expandVertically(),
-                    exit = fadeOut(tween(120)) + shrinkVertically()
-                ) {
-                    val statusLabel = when {
-                        uiState.isPreparingImage -> "Preparing image..."
-                        isLoading -> (engineState as? EngineLifecycleState.Loading)?.stage ?: "Loading weights..."
-                        lastMsg?.isThinking == true -> "Thinking..."
-                        else -> "Working"
-                    }
-                    WorkingStatusIndicator(label = statusLabel)
-                }
-
-                AnimatedVisibility(
-                    visible = attachedDocuments.isNotEmpty() || uiState.isIndexingDocument,
-                    enter = fadeIn(tween(140)) + expandVertically(),
-                    exit = fadeOut(tween(120)) + shrinkVertically()
-                ) {
-                    AttachedDocumentsStrip(
-                        documents = attachedDocuments,
-                        isIndexing = uiState.isIndexingDocument,
-                        onRemoveDocument = onRemoveDocument
-                    )
-                }
-
-                AnimatedVisibility(
-                    visible = uiState.pendingImage != null || uiState.isPreparingImage,
-                    enter = if (reducedMotion) EnterTransition.None else (
-                        fadeIn(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong)) +
-                            expandVertically(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong))
-                        ),
-                    exit = if (reducedMotion) ExitTransition.None else (
-                        fadeOut(tween(MotionTokens.DurationQuickMs)) +
-                            shrinkVertically(tween(MotionTokens.DurationQuickMs))
-                        )
-                ) {
-                    PendingAttachmentCard(
-                        imageUri = uiState.pendingImage?.uriString,
-                        resolutionLabel = uiState.pendingImage?.let { "${it.width}×${it.height} RGB" },
-                        isPreparing = uiState.isPreparingImage,
-                        visionWarning = activeModel != null && !activeModel.isVisionCapable,
-                        onPickVisionPrompt = { quick -> promptInput = quick },
-                        onClear = onClearPendingImage
-                    )
-                }
-
-                // Floating quick-action mini pills
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    val thinkOn = uiState.tuning.enableThinking
-                    FloatingPillButton(
-                        onClick = {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onToggleThinking()
-                        },
-                        enabled = !isGenerating,
-                        containerColor = if (thinkOn) {
-                            MaterialTheme.colorScheme.tertiaryContainer
+                SlashCommandPopover(
+                    commands = matchingSlashCommands,
+                    onSelectCommand = { cmd ->
+                        if (cmd.isActionCommand) {
+                            promptInput = ""
+                            onExecuteSlashAction(cmd.id)
                         } else {
-                            semantic.floatingSurface
-                        },
-                        contentColor = if (thinkOn) {
-                            MaterialTheme.colorScheme.onTertiaryContainer
+                            promptInput = cmd.promptBody
+                        }
+                    }
+                )
+            }
+
+            AnimatedVisibility(
+                visible = isListening,
+                enter = fadeIn(tween(120)) + expandVertically(),
+                exit = fadeOut(tween(100)) + shrinkVertically()
+            ) {
+                VoiceListeningBanner(
+                    partialTranscript = partialTranscript,
+                    onStopDictation = onStopVoiceDictation
+                )
+            }
+
+            AnimatedVisibility(
+                visible = isGenerating || isLoading || isPreparingImage,
+                enter = fadeIn(tween(140)) + expandVertically(),
+                exit = fadeOut(tween(120)) + shrinkVertically()
+            ) {
+                val statusLabel = when {
+                    isPreparingImage -> "Preparing image..."
+                    isLoading -> loadingStage ?: "Loading weights..."
+                    isThinkingStream -> "Thinking..."
+                    else -> "Working"
+                }
+                WorkingStatusIndicator(label = statusLabel)
+            }
+
+            AnimatedVisibility(
+                visible = attachedDocuments.isNotEmpty() || isIndexingDocument,
+                enter = fadeIn(tween(140)) + expandVertically(),
+                exit = fadeOut(tween(120)) + shrinkVertically()
+            ) {
+                AttachedDocumentsStrip(
+                    documents = attachedDocuments,
+                    isIndexing = isIndexingDocument,
+                    onRemoveDocument = onRemoveDocument
+                )
+            }
+
+            AnimatedVisibility(
+                visible = pendingImage != null || isPreparingImage,
+                enter = if (reducedMotion) EnterTransition.None else (
+                    fadeIn(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong)) +
+                        expandVertically(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong))
+                    ),
+                exit = if (reducedMotion) ExitTransition.None else (
+                    fadeOut(tween(MotionTokens.DurationQuickMs)) +
+                        shrinkVertically(tween(MotionTokens.DurationQuickMs))
+                    )
+            ) {
+                PendingAttachmentCard(
+                    imageUri = pendingImage?.uriString,
+                    resolutionLabel = pendingImage?.let { "${it.width}×${it.height} RGB" },
+                    isPreparing = isPreparingImage,
+                    visionWarning = !activeModelVisionCapable,
+                    onPickVisionPrompt = { quick -> promptInput = quick },
+                    onClear = onClearPendingImage
+                )
+            }
+
+            // Floating quick-action mini pills
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                FloatingPillButton(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onToggleThinking()
+                    },
+                    enabled = !isGenerating,
+                    containerColor = if (enableThinking) {
+                        MaterialTheme.colorScheme.tertiaryContainer
+                    } else {
+                        semantic.floatingSurface
+                    },
+                    contentColor = if (enableThinking) {
+                        MaterialTheme.colorScheme.onTertiaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    borderColor = if (enableThinking) {
+                        MaterialTheme.colorScheme.tertiary.copy(alpha = 0.45f)
+                    } else {
+                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.85f)
+                    },
+                    modifier = Modifier.testTag("thinking_toggle_chip")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Psychology,
+                        contentDescription = stringResource(R.string.btn_toggle_thinking),
+                        tint = if (enableThinking) {
+                            MaterialTheme.colorScheme.tertiary
                         } else {
                             MaterialTheme.colorScheme.onSurfaceVariant
                         },
-                        borderColor = if (thinkOn) {
-                            MaterialTheme.colorScheme.tertiary.copy(alpha = 0.45f)
-                        } else {
-                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.85f)
-                        },
-                        modifier = Modifier.testTag("thinking_toggle_chip")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Psychology,
-                            contentDescription = stringResource(R.string.btn_toggle_thinking),
-                            tint = if (thinkOn) {
-                                MaterialTheme.colorScheme.tertiary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = if (thinkOn) "Think: ON" else "Think: OFF",
-                            style = MaterialTheme.typography.labelMedium
-                        )
-                    }
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = if (enableThinking) "Think: ON" else "Think: OFF",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
 
+                FloatingPillButton(
+                    onClick = launchDocumentPicker,
+                    modifier = Modifier.testTag("attach_document_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Description,
+                        contentDescription = stringResource(R.string.btn_attach_document),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = "Docs",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+
+                FloatingPillButton(
+                    onClick = {
+                        photoPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    },
+                    modifier = Modifier.testTag("photo_picker_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.AddPhotoAlternate,
+                        contentDescription = stringResource(R.string.btn_attach_photo),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = "Photo",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+
+                FloatingPillButton(
+                    onClick = onOpenCamera,
+                    modifier = Modifier.testTag("camera_capture_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.CameraAlt,
+                        contentDescription = stringResource(R.string.btn_capture_camera),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = "Camera",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+
+                if (hasMessages) {
                     FloatingPillButton(
-                        onClick = launchDocumentPicker,
-                        modifier = Modifier.testTag("attach_document_button")
+                        onClick = onExportMarkdown,
+                        modifier = Modifier.testTag("export_markdown_button")
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.Description,
-                            contentDescription = stringResource(R.string.btn_attach_document),
+                            imageVector = Icons.Rounded.Share,
+                            contentDescription = stringResource(R.string.btn_export_markdown),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                         Text(
-                            text = "Docs",
+                            text = "Export",
                             style = MaterialTheme.typography.labelMedium
                         )
                     }
+                }
+            }
 
-                    FloatingPillButton(
-                        onClick = {
-                            photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        },
-                        modifier = Modifier.testTag("photo_picker_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.AddPhotoAlternate,
-                            contentDescription = stringResource(R.string.btn_attach_photo),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = "Photo",
-                            style = MaterialTheme.typography.labelMedium
-                        )
-                    }
+            // Main Floating Capsule Prompt Composer (Cursor iOS: + | Prompt / Slash | Mic -> Send -> Stop)
+            val sendInteraction = remember { MutableInteractionSource() }
+            val stopInteraction = remember { MutableInteractionSource() }
+            val micInteraction = remember { MutableInteractionSource() }
 
-                    FloatingPillButton(
-                        onClick = { showCameraDialog = true },
-                        modifier = Modifier.testTag("camera_capture_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.CameraAlt,
-                            contentDescription = stringResource(R.string.btn_capture_camera),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = "Camera",
-                            style = MaterialTheme.typography.labelMedium
-                        )
-                    }
-
-                    if (uiState.messages.isNotEmpty()) {
-                        FloatingPillButton(
-                            onClick = exportAction,
-                            modifier = Modifier.testTag("export_markdown_button")
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = semantic.floatingSurface,
+                shadowElevation = if (semantic.isDark) 4.dp else 10.dp,
+                border = BorderStroke(
+                    1.dp,
+                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.9f)
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box {
+                        Surface(
+                            onClick = { showComposerMenu = true },
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            modifier = Modifier
+                                .size(44.dp)
+                                .minimumInteractiveComponentSize()
                         ) {
-                            Icon(
-                                imageVector = Icons.Rounded.Share,
-                                contentDescription = stringResource(R.string.btn_export_markdown),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(15.dp)
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Add,
+                                    contentDescription = "Quick actions menu",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = showComposerMenu,
+                            onDismissRequest = { showComposerMenu = false }
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("Attach Document (PDF / TXT)") },
+                                leadingIcon = { Icon(Icons.Rounded.Description, contentDescription = null) },
+                                onClick = {
+                                    showComposerMenu = false
+                                    launchDocumentPicker()
+                                }
                             )
+                            DropdownMenuItem(
+                                text = { Text("Attach Photo") },
+                                leadingIcon = { Icon(Icons.Rounded.AddPhotoAlternate, contentDescription = null) },
+                                onClick = {
+                                    showComposerMenu = false
+                                    photoPickerLauncher.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Capture Photo") },
+                                leadingIcon = { Icon(Icons.Rounded.CameraAlt, contentDescription = null) },
+                                onClick = {
+                                    showComposerMenu = false
+                                    onOpenCamera()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Slash Commands (/)") },
+                                leadingIcon = { Icon(Icons.Rounded.Add, contentDescription = null) },
+                                onClick = {
+                                    showComposerMenu = false
+                                    promptInput = "/"
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Customize & Telemetry") },
+                                leadingIcon = { Icon(Icons.Rounded.Tune, contentDescription = null) },
+                                onClick = {
+                                    showComposerMenu = false
+                                    onOpenTelemetrySheet()
+                                }
+                            )
+                            if (hasMessages) {
+                                DropdownMenuItem(
+                                    text = { Text("Export Markdown") },
+                                    leadingIcon = { Icon(Icons.Rounded.Share, contentDescription = null) },
+                                    onClick = {
+                                        showComposerMenu = false
+                                        onExportMarkdown()
+                                    }
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("New Thread") },
+                                leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
+                                onClick = {
+                                    showComposerMenu = false
+                                    onResetConversation()
+                                }
+                            )
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .defaultMinSize(minHeight = 44.dp)
+                            .padding(vertical = 10.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        if (promptInput.isEmpty()) {
                             Text(
-                                text = "Export",
-                                style = MaterialTheme.typography.labelMedium
+                                text = if (!hasMessages) {
+                                    stringResource(R.string.prompt_hint)
+                                } else {
+                                    "Follow up or type /..."
+                                },
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+                        }
+                        BasicTextField(
+                            value = promptInput,
+                            onValueChange = { promptInput = it },
+                            textStyle = MaterialTheme.typography.bodyLarge.copy(
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                            maxLines = 5,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("prompt_input_field")
+                        )
+                    }
+
+                    val actionMode = when {
+                        isGenerating -> ComposerActionMode.STOP
+                        promptInput.isBlank() && pendingImage == null -> ComposerActionMode.MIC
+                        else -> ComposerActionMode.SEND
+                    }
+
+                    AnimatedContent(
+                        targetState = actionMode,
+                        transitionSpec = {
+                            if (reducedMotion) {
+                                EnterTransition.None togetherWith ExitTransition.None
+                            } else {
+                                (fadeIn(tween(150, easing = MotionTokens.EaseOutStrong)) +
+                                    scaleIn(initialScale = 0.88f, animationSpec = tween(150, easing = MotionTokens.EaseOutStrong))) togetherWith
+                                    (fadeOut(tween(110)) + scaleOut(targetScale = 0.88f, animationSpec = tween(110)))
+                            }
+                        },
+                        label = "composerActionMorph"
+                    ) { mode ->
+                        when (mode) {
+                            ComposerActionMode.STOP -> {
+                                Surface(
+                                    onClick = onStopGeneration,
+                                    interactionSource = stopInteraction,
+                                    shape = CircleShape,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .minimumInteractiveComponentSize()
+                                        .pressScale(stopInteraction, pressedScale = 0.90f)
+                                        .testTag("stop_generation_button")
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Stop,
+                                            contentDescription = stringResource(R.string.btn_stop_generation),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            ComposerActionMode.MIC -> {
+                                Surface(
+                                    onClick = {
+                                        if (isListening) {
+                                            onStopVoiceDictation()
+                                        } else {
+                                            val granted = ContextCompat.checkSelfPermission(
+                                                context,
+                                                Manifest.permission.RECORD_AUDIO
+                                            ) == PackageManager.PERMISSION_GRANTED
+                                            if (granted) {
+                                                onStartVoiceDictation(appendDictatedText)
+                                            } else {
+                                                audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                            }
+                                        }
+                                    },
+                                    interactionSource = micInteraction,
+                                    shape = CircleShape,
+                                    color = if (isListening) {
+                                        semantic.liveEmerald
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainerHigh
+                                    },
+                                    contentColor = if (isListening) {
+                                        Color.White
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .minimumInteractiveComponentSize()
+                                        .pressScale(micInteraction, pressedScale = 0.90f)
+                                        .testTag("voice_dictate_button")
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = if (isListening) Icons.Rounded.Stop else Icons.Rounded.Mic,
+                                            contentDescription = if (isListening) {
+                                                stringResource(R.string.btn_stop_dictate)
+                                            } else {
+                                                stringResource(R.string.btn_voice_dictate)
+                                            },
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            ComposerActionMode.SEND -> {
+                                val canSend = isReady && (promptInput.isNotBlank() || pendingImage != null)
+                                Surface(
+                                    onClick = {
+                                        val text = promptInput
+                                        promptInput = ""
+                                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        onSendPrompt(text)
+                                    },
+                                    enabled = canSend,
+                                    interactionSource = sendInteraction,
+                                    shape = CircleShape,
+                                    color = if (canSend) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceContainerHigh
+                                    },
+                                    contentColor = if (canSend) {
+                                        MaterialTheme.colorScheme.onPrimary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
+                                    },
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .minimumInteractiveComponentSize()
+                                        .pressScale(sendInteraction, enabled = canSend, pressedScale = 0.90f)
+                                        .testTag("send_prompt_button")
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.ArrowUpward,
+                                            contentDescription = stringResource(R.string.btn_send_prompt),
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+}
 
-                // Main Floating Capsule Prompt Composer (Cursor iOS: + | Prompt / Slash | Mic -> Send -> Stop)
-                val sendInteraction = remember { MutableInteractionSource() }
-                val stopInteraction = remember { MutableInteractionSource() }
-                val micInteraction = remember { MutableInteractionSource() }
-
-                Surface(
-                    shape = RoundedCornerShape(28.dp),
-                    color = semantic.floatingSurface,
-                    shadowElevation = if (semantic.isDark) 4.dp else 10.dp,
-                    border = BorderStroke(
-                        1.dp,
-                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.9f)
-                    ),
-                    modifier = Modifier.fillMaxWidth()
+@Composable
+private fun LowMemoryWarningBanner(
+    warning: MemoryPressureWarning,
+    canTrimContext: Boolean,
+    onTrimContext: () -> Unit,
+    onUnloadModel: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val semantic = LocalSemanticColors.current
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = semantic.floatingSurface,
+            shadowElevation = if (semantic.isDark) 3.dp else 6.dp,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.55f)),
+            modifier = Modifier
+                .widthIn(max = 720.dp)
+                .align(Alignment.Center)
+                .fillMaxWidth()
+                .testTag("low_memory_warning_banner")
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.Bottom,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Box {
-                            Surface(
-                                onClick = { showComposerMenu = true },
-                                shape = CircleShape,
-                                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                                modifier = Modifier
-                                    .size(44.dp)
-                                    .minimumInteractiveComponentSize()
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.Add,
-                                        contentDescription = "Quick actions menu",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
-                            }
-
-                            DropdownMenu(
-                                expanded = showComposerMenu,
-                                onDismissRequest = { showComposerMenu = false }
-                            ) {
-                                DropdownMenuItem(
-                                    text = { Text("Attach Document (PDF / TXT)") },
-                                    leadingIcon = { Icon(Icons.Rounded.Description, contentDescription = null) },
-                                    onClick = {
-                                        showComposerMenu = false
-                                        launchDocumentPicker()
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Attach Photo") },
-                                    leadingIcon = { Icon(Icons.Rounded.AddPhotoAlternate, contentDescription = null) },
-                                    onClick = {
-                                        showComposerMenu = false
-                                        photoPickerLauncher.launch(
-                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                                        )
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Capture Photo") },
-                                    leadingIcon = { Icon(Icons.Rounded.CameraAlt, contentDescription = null) },
-                                    onClick = {
-                                        showComposerMenu = false
-                                        showCameraDialog = true
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Slash Commands (/)") },
-                                    leadingIcon = { Icon(Icons.Rounded.Add, contentDescription = null) },
-                                    onClick = {
-                                        showComposerMenu = false
-                                        promptInput = "/"
-                                    }
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Customize & Telemetry") },
-                                    leadingIcon = { Icon(Icons.Rounded.Tune, contentDescription = null) },
-                                    onClick = {
-                                        showComposerMenu = false
-                                        onOpenTelemetrySheet()
-                                    }
-                                )
-                                if (uiState.messages.isNotEmpty()) {
-                                    DropdownMenuItem(
-                                        text = { Text("Export Markdown") },
-                                        leadingIcon = { Icon(Icons.Rounded.Share, contentDescription = null) },
-                                        onClick = {
-                                            showComposerMenu = false
-                                            exportAction()
-                                        }
-                                    )
-                                }
-                                DropdownMenuItem(
-                                    text = { Text("New Thread") },
-                                    leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
-                                    onClick = {
-                                        showComposerMenu = false
-                                        onResetConversation()
-                                    }
-                                )
-                            }
-                        }
-
-                        Box(
+                    Icon(
+                        imageVector = Icons.Rounded.WarningAmber,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = warning.severityLabel,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "${warning.availableRamMb} MB free — keeping model loaded.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (canTrimContext) {
+                        TextButton(
+                            onClick = onTrimContext,
                             modifier = Modifier
-                                .weight(1f)
-                                .defaultMinSize(minHeight = 44.dp)
-                                .padding(vertical = 10.dp),
-                            contentAlignment = Alignment.CenterStart
+                                .defaultMinSize(minHeight = 48.dp)
+                                .testTag("memory_warning_trim_button")
                         ) {
-                            if (promptInput.isEmpty()) {
-                                Text(
-                                    text = if (uiState.messages.isEmpty()) {
-                                        stringResource(R.string.prompt_hint)
-                                    } else {
-                                        "Follow up or type /..."
-                                    },
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            BasicTextField(
-                                value = promptInput,
-                                onValueChange = { promptInput = it },
-                                textStyle = MaterialTheme.typography.bodyLarge.copy(
-                                    color = MaterialTheme.colorScheme.onSurface
-                                ),
-                                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                                maxLines = 5,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("prompt_input_field")
-                            )
+                            Text("Trim Context", style = MaterialTheme.typography.labelLarge)
                         }
-
-                        val actionMode = when {
-                            isGenerating -> ComposerActionMode.STOP
-                            promptInput.isBlank() && uiState.pendingImage == null -> ComposerActionMode.MIC
-                            else -> ComposerActionMode.SEND
-                        }
-
-                        AnimatedContent(
-                            targetState = actionMode,
-                            transitionSpec = {
-                                if (reducedMotion) {
-                                    EnterTransition.None togetherWith ExitTransition.None
-                                } else {
-                                    (fadeIn(tween(150, easing = MotionTokens.EaseOutStrong)) +
-                                        scaleIn(initialScale = 0.88f, animationSpec = tween(150, easing = MotionTokens.EaseOutStrong))) togetherWith
-                                        (fadeOut(tween(110)) + scaleOut(targetScale = 0.88f, animationSpec = tween(110)))
-                                }
-                            },
-                            label = "composerActionMorph"
-                        ) { mode ->
-                            when (mode) {
-                                ComposerActionMode.STOP -> {
-                                    Surface(
-                                        onClick = onStopGeneration,
-                                        interactionSource = stopInteraction,
-                                        shape = CircleShape,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                                        modifier = Modifier
-                                            .size(44.dp)
-                                            .minimumInteractiveComponentSize()
-                                            .pressScale(stopInteraction, pressedScale = 0.90f)
-                                            .testTag("stop_generation_button")
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Icon(
-                                                imageVector = Icons.Rounded.Stop,
-                                                contentDescription = stringResource(R.string.btn_stop_generation),
-                                                modifier = Modifier.size(20.dp)
-                                            )
-                                        }
-                                    }
-                                }
-
-                                ComposerActionMode.MIC -> {
-                                    Surface(
-                                        onClick = {
-                                            if (isListening) {
-                                                onStopVoiceDictation()
-                                            } else {
-                                                val granted = ContextCompat.checkSelfPermission(
-                                                    context,
-                                                    Manifest.permission.RECORD_AUDIO
-                                                ) == PackageManager.PERMISSION_GRANTED
-                                                if (granted) {
-                                                    onStartVoiceDictation(appendDictatedText)
-                                                } else {
-                                                    audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                                }
-                                            }
-                                        },
-                                        interactionSource = micInteraction,
-                                        shape = CircleShape,
-                                        color = if (isListening) {
-                                            semantic.liveEmerald
-                                        } else {
-                                            MaterialTheme.colorScheme.surfaceContainerHigh
-                                        },
-                                        contentColor = if (isListening) {
-                                            Color.White
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant
-                                        },
-                                        modifier = Modifier
-                                            .size(44.dp)
-                                            .minimumInteractiveComponentSize()
-                                            .pressScale(micInteraction, pressedScale = 0.90f)
-                                            .testTag("voice_dictate_button")
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Icon(
-                                                imageVector = if (isListening) Icons.Rounded.Stop else Icons.Rounded.Mic,
-                                                contentDescription = if (isListening) {
-                                                    stringResource(R.string.btn_stop_dictate)
-                                                } else {
-                                                    stringResource(R.string.btn_voice_dictate)
-                                                },
-                                                modifier = Modifier.size(20.dp)
-                                            )
-                                        }
-                                    }
-                                }
-
-                                ComposerActionMode.SEND -> {
-                                    val canSend = isReady && (promptInput.isNotBlank() || uiState.pendingImage != null)
-                                    Surface(
-                                        onClick = {
-                                            val text = promptInput
-                                            promptInput = ""
-                                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            onSendPrompt(text)
-                                        },
-                                        enabled = canSend,
-                                        interactionSource = sendInteraction,
-                                        shape = CircleShape,
-                                        color = if (canSend) {
-                                            MaterialTheme.colorScheme.primary
-                                        } else {
-                                            MaterialTheme.colorScheme.surfaceContainerHigh
-                                        },
-                                        contentColor = if (canSend) {
-                                            MaterialTheme.colorScheme.onPrimary
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
-                                        },
-                                        modifier = Modifier
-                                            .size(44.dp)
-                                            .minimumInteractiveComponentSize()
-                                            .pressScale(sendInteraction, enabled = canSend, pressedScale = 0.90f)
-                                            .testTag("send_prompt_button")
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Icon(
-                                                imageVector = Icons.Rounded.ArrowUpward,
-                                                contentDescription = stringResource(R.string.btn_send_prompt),
-                                                modifier = Modifier.size(20.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    }
+                    TextButton(
+                        onClick = onUnloadModel,
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 48.dp)
+                            .testTag("memory_warning_unload_button")
+                    ) {
+                        Text(
+                            text = "Unload",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                    TextButton(
+                        onClick = onDismiss,
+                        modifier = Modifier
+                            .defaultMinSize(minHeight = 48.dp)
+                            .testTag("memory_warning_dismiss_button")
+                    ) {
+                        Text("Dismiss", style = MaterialTheme.typography.labelLarge)
                     }
                 }
             }
@@ -1403,12 +1629,12 @@ private fun EditorialChatItem(
     canEditPrompt: Boolean,
     isSpeakingThis: Boolean,
     onCopyMessage: (String) -> Unit,
-    onToggleReadAloud: () -> Unit,
-    onSelectBranch: (String) -> Unit,
+    onToggleReadAloud: (String, String) -> Unit,
+    onSelectBranch: (String, String) -> Unit,
     onInspectCitation: (DocumentCitationUi) -> Unit,
     onRegenerate: () -> Unit,
-    onEditPrompt: () -> Unit,
-    onDeleteMessage: () -> Unit,
+    onEditPrompt: (String) -> Unit,
+    onDeleteMessage: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isUser = message.role == ChatRole.USER
@@ -1470,15 +1696,15 @@ private fun EditorialChatItem(
                 isSpeakingThis = false,
                 revisionIndex = message.revisionIndex,
                 siblingIds = message.siblingIds,
-                onSelectBranch = onSelectBranch,
+                onSelectBranch = { targetId -> onSelectBranch(message.branchGroupId, targetId) },
                 onCopy = {
                     onCopyMessage(message.text)
                     justCopied = true
                 },
                 onToggleReadAloud = {},
-                onEdit = onEditPrompt,
+                onEdit = { onEditPrompt(message.text) },
                 onRegenerate = onRegenerate,
-                onDelete = onDeleteMessage
+                onDelete = { onDeleteMessage(message.id) }
             )
         }
     } else {
@@ -1522,6 +1748,33 @@ private fun EditorialChatItem(
                 }
             }
 
+            if (!message.isStreaming && message.isInterrupted) {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.45f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.4f)),
+                    modifier = Modifier.testTag("interrupted_badge")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.tertiary)
+                        )
+                        Text(
+                            text = "Interrupted",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                    }
+                }
+            }
+
             if (message.citations.isNotEmpty()) {
                 CitationsChipRow(
                     citations = message.citations,
@@ -1538,7 +1791,7 @@ private fun EditorialChatItem(
                 )
             }
 
-            if (!message.isStreaming && (message.text.isNotEmpty() || message.thinkingText.isNotBlank())) {
+            if (!message.isStreaming && (message.text.isNotEmpty() || message.thinkingText.isNotBlank() || message.isInterrupted)) {
                 MessageActionRow(
                     justCopied = justCopied,
                     canEditPrompt = false,
@@ -1547,15 +1800,17 @@ private fun EditorialChatItem(
                     isSpeakingThis = isSpeakingThis,
                     revisionIndex = message.revisionIndex,
                     siblingIds = message.siblingIds,
-                    onSelectBranch = onSelectBranch,
+                    onSelectBranch = { targetId -> onSelectBranch(message.branchGroupId, targetId) },
                     onCopy = {
                         onCopyMessage(message.text.ifEmpty { message.thinkingText })
                         justCopied = true
                     },
-                    onToggleReadAloud = onToggleReadAloud,
-                    onEdit = onEditPrompt,
+                    onToggleReadAloud = {
+                        onToggleReadAloud(message.id, message.text.ifEmpty { message.thinkingText })
+                    },
+                    onEdit = {},
                     onRegenerate = onRegenerate,
-                    onDelete = onDeleteMessage
+                    onDelete = { onDeleteMessage(message.id) }
                 )
             }
         }

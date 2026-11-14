@@ -1,8 +1,10 @@
 package com.example.data.engine
 
 import android.app.ActivityManager
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.os.Debug
+import androidx.compose.runtime.Immutable
 import com.example.domain.engine.EngineLifecycleState
 import com.example.domain.engine.InferenceEvent
 import com.example.domain.engine.InferenceInput
@@ -21,6 +23,15 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 
+@Immutable
+data class MemoryPressureWarning(
+    val level: Int,
+    val severityLabel: String,
+    val availableRamMb: Long,
+    val totalRamMb: Long,
+    val timestampMillis: Long = System.currentTimeMillis()
+)
+
 /**
  * Coordinates runtime selection between LiteRT-LM / LiteRT CompiledModel and llama.cpp,
  * enforces RAM preflight checks, and handles OS memory trim notifications.
@@ -35,6 +46,9 @@ class InferenceEngineCoordinator(
 
     private val _activeModelEntry = MutableStateFlow<LocalModelEntry?>(null)
     val activeModelEntry: StateFlow<LocalModelEntry?> = _activeModelEntry.asStateFlow()
+
+    private val _memoryPressureWarning = MutableStateFlow<MemoryPressureWarning?>(null)
+    val memoryPressureWarning: StateFlow<MemoryPressureWarning?> = _memoryPressureWarning.asStateFlow()
 
     @OptIn(ExperimentalCoroutinesApi::class)
     val engineState: StateFlow<EngineLifecycleState>
@@ -127,6 +141,11 @@ class InferenceEngineCoordinator(
         llamaCppEngine.unloadModel()
         _activeEngine.value = null
         _activeModelEntry.value = null
+        _memoryPressureWarning.value = null
+    }
+
+    fun dismissMemoryPressureWarning() {
+        _memoryPressureWarning.value = null
     }
 
     suspend fun getMemoryStats(): MemoryStats {
@@ -150,8 +169,34 @@ class InferenceEngineCoordinator(
         )
     }
 
+    @Suppress("DEPRECATION")
     fun onTrimMemory(level: Int) {
         liteRtEngine.onTrimMemory(level)
         llamaCppEngine.onTrimMemory(level)
+
+        // Never auto-unload mid-chat; emit a user-facing warning only on genuine memory pressure
+        // (ignoring routine TRIM_MEMORY_UI_HIDDEN=20 and TRIM_MEMORY_BACKGROUND=40 transitions).
+        if (_activeModelEntry.value == null) return
+        val isGenuinePressure = level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+            level == ComponentCallbacks2.TRIM_MEMORY_COMPLETE
+        if (!isGenuinePressure) return
+
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val memInfo = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(memInfo)
+        val availMb = memInfo.availMem / (1024L * 1024L)
+        val totalMb = memInfo.totalMem / (1024L * 1024L)
+        val label = when (level) {
+            ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> "Critical system memory"
+            ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> "Critical low memory"
+            else -> "Low memory warning"
+        }
+        _memoryPressureWarning.value = MemoryPressureWarning(
+            level = level,
+            severityLabel = label,
+            availableRamMb = availMb,
+            totalRamMb = totalMb
+        )
     }
 }

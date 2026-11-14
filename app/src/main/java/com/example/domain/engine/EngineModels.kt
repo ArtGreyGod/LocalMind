@@ -9,6 +9,7 @@ enum class ModelFormat(val label: String, val extensions: List<String>) {
     GGUF("GGUF", listOf("gguf"))
 }
 
+@Serializable
 enum class HardwareAccelerator(val label: String) {
     NPU("NPU"),
     GPU("GPU"),
@@ -81,6 +82,7 @@ data class InferenceInput(
     val systemPrompt: String? = null
 )
 
+@Serializable
 data class GenerationTelemetry(
     val prefillTokens: Int,
     val prefillTimeMs: Long,

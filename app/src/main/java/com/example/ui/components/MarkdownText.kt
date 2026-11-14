@@ -49,6 +49,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
@@ -246,11 +247,50 @@ fun MarkdownText(
         return
     }
 
-    SelectionContainer(modifier = modifier) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            blocks.forEachIndexed { index, block ->
-                val isLast = index == blocks.lastIndex
-                val appendCursor = isStreaming && isLast
+    if (isStreaming) {
+        MarkdownBlocksColumn(
+            blocks = blocks,
+            color = color,
+            style = style,
+            isStreaming = true,
+            codeContainerColor = codeContainerColor,
+            inlineCodeBackground = inlineCodeBackground,
+            accentColor = accentColor,
+            modifier = modifier
+        )
+    } else {
+        SelectionContainer(modifier = modifier) {
+            MarkdownBlocksColumn(
+                blocks = blocks,
+                color = color,
+                style = style,
+                isStreaming = false,
+                codeContainerColor = codeContainerColor,
+                inlineCodeBackground = inlineCodeBackground,
+                accentColor = accentColor
+            )
+        }
+    }
+}
+
+@Composable
+private fun MarkdownBlocksColumn(
+    blocks: List<MarkdownBlock>,
+    color: Color,
+    style: TextStyle,
+    isStreaming: Boolean,
+    codeContainerColor: Color,
+    inlineCodeBackground: Color,
+    accentColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        blocks.forEachIndexed { index, block ->
+            val isLast = index == blocks.lastIndex
+            val appendCursor = isStreaming && isLast
                 when (block) {
                     is MarkdownBlock.Heading -> {
                         val headingStyle = when (block.level) {
@@ -408,7 +448,6 @@ fun MarkdownText(
             }
         }
     }
-}
 
 @Composable
 private fun MarkdownCodeBlock(
@@ -429,7 +468,15 @@ private fun MarkdownCodeBlock(
     }
 
     val copyInteractionSource = remember { MutableInteractionSource() }
-    val codeLines = remember(code) { code.split("\n") }
+    val lineCount = remember(code) { code.count { it == '\n' } + 1 }
+    val gutterText = remember(lineCount) {
+        buildString {
+            for (line in 1..lineCount) {
+                if (line > 1) append('\n')
+                append(line)
+            }
+        }
+    }
 
     Surface(
         shape = RoundedCornerShape(14.dp),
@@ -446,24 +493,19 @@ private fun MarkdownCodeBlock(
                     .padding(start = 12.dp, end = 52.dp, top = 12.dp, bottom = 12.dp),
                 verticalAlignment = Alignment.Top
             ) {
-                // Subtle line number gutter (matching Cursor's clean thread code block)
-                if (codeLines.size > 1 || language.isBlank()) {
-                    Column(
-                        modifier = Modifier.padding(end = 12.dp),
-                        horizontalAlignment = Alignment.End
-                    ) {
-                        codeLines.forEachIndexed { idx, _ ->
-                            Text(
-                                text = "${idx + 1}",
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    fontFamily = JetBrainsMonoFontFamily,
-                                    fontSize = 12.5.sp,
-                                    lineHeight = 19.sp
-                                ),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f)
-                            )
-                        }
-                    }
+                // Single-Text line number gutter avoids N-composable churn while code streams
+                if (lineCount > 1 || language.isBlank()) {
+                    Text(
+                        text = gutterText,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontSize = 12.5.sp,
+                            lineHeight = 19.sp,
+                            textAlign = TextAlign.End
+                        ),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                        modifier = Modifier.padding(end = 12.dp)
+                    )
                 }
 
                 Box(

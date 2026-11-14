@@ -23,6 +23,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -37,6 +39,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -244,6 +247,15 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
         initializeDatabaseThread()
         startMemoryPolling()
         observeVoiceErrors()
+        observeMemoryPressureWarnings()
+    }
+
+    private fun observeMemoryPressureWarnings() {
+        viewModelScope.launch {
+            engineCoordinator.memoryPressureWarning.collect { warning ->
+                _uiState.update { it.copy(memoryPressureWarning = warning) }
+            }
+        }
     }
 
     private fun observeVoiceErrors() {
@@ -663,9 +675,24 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(pendingPreflightWarning = null) }
     }
 
+    fun dismissMemoryPressureWarning() {
+        engineCoordinator.dismissMemoryPressureWarning()
+    }
+
+    fun trimContextFromMemoryWarning() {
+        engineCoordinator.dismissMemoryPressureWarning()
+        trimOlderContextTurns()
+    }
+
+    fun unloadFromMemoryWarning() {
+        engineCoordinator.dismissMemoryPressureWarning()
+        unloadActiveModel()
+    }
+
     fun unloadActiveModel() {
         viewModelScope.launch {
-            generationJob?.cancel()
+            engineCoordinator.cancelGeneration()
+            generationJob?.cancelAndJoin()
             engineCoordinator.unloadActiveModel()
             preferencesRepository.saveLastLoadedModelId(null)
             refreshMemoryStatsNow()
@@ -983,12 +1010,14 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             role = ChatRole.ASSISTANT,
             text = "",
             isStreaming = true,
+            isInterrupted = false,
             turnOrder = assistantTurnOrder,
             branchGroupId = assistantBranchGroupId,
             revisionIndex = combinedSiblings.lastIndex,
             siblingIds = combinedSiblings
         )
 
+        val basePriorTokens = estimateTokenCount(priorMessages + userMessage)
         val nextList = priorMessages + userMessage + placeholderAssistant
         _uiState.update {
             it.copy(
@@ -998,12 +1027,25 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                 liveDecodeTokensPerSec = 0.0,
                 livePrefillTokensPerSec = 0.0,
                 liveDecodeTokenCount = 0,
-                estimatedContextTokens = estimateTokenCount(nextList)
+                estimatedContextTokens = basePriorTokens
             )
         }
 
         generationJob?.cancel()
         generationJob = viewModelScope.launch {
+            // Create the assistant row upfront marked interrupted=true until Completed clears it,
+            // so even a hard process crash retains any checkpointed thinking & partial text.
+            withContext(Dispatchers.IO) {
+                chatHistoryRepository.saveMessage(
+                    threadId = threadId,
+                    message = placeholderAssistant.copy(isStreaming = false, isInterrupted = true),
+                    turnOrder = assistantTurnOrder,
+                    branchGroupId = assistantBranchGroupId,
+                    revisionIndex = assistantRevisionIndex,
+                    isActiveBranch = true
+                )
+            }
+
             val ragResult = localRagRepository.retrieveContextForPrompt(
                 query = userMessage.text,
                 attachedDocs = attachedDocuments.value,
@@ -1056,52 +1098,134 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                 systemPrompt = tuning.systemPrompt
             )
 
+            val thinkingBuffer = StringBuilder()
+            val answerBuffer = StringBuilder()
+            var currentlyThinking = false
+            var latestDecodeTokPerSec = 0.0
+            var latestPrefillTokPerSec = 0.0
+            var latestDecodeCount = 0
+            var lastUiFlushMs = 0L
+            var lastDbCheckpointMs = 0L
+            var dirtyUi = false
+            var checkpointJob: Job? = null
+
+            fun applyBufferedStateToUi(
+                isStreamingNow: Boolean,
+                isThinkingNow: Boolean,
+                isInterruptedNow: Boolean,
+                fallbackErrorIfBlank: String? = null
+            ): ChatMessageUi? {
+                val finalThinking = thinkingBuffer.toString()
+                val rawAnswer = answerBuffer.toString()
+                val finalAnswer = if (rawAnswer.isEmpty() && finalThinking.isBlank() && fallbackErrorIfBlank != null) {
+                    "[Error] $fallbackErrorIfBlank"
+                } else {
+                    rawAnswer
+                }
+                val streamTokens = (finalAnswer.length + finalThinking.length) / 4
+                var snapshot: ChatMessageUi? = null
+                _uiState.update { state ->
+                    val updatedMessages = state.messages.map { msg ->
+                        if (msg.id == assistantMsgId) {
+                            msg.copy(
+                                thinkingText = finalThinking,
+                                text = finalAnswer,
+                                isThinking = isThinkingNow,
+                                isStreaming = isStreamingNow,
+                                isInterrupted = isInterruptedNow,
+                                citations = if (citations.isNotEmpty()) citations else msg.citations
+                            ).also { snapshot = it }
+                        } else {
+                            msg
+                        }
+                    }
+                    state.copy(
+                        livePrefillTokensPerSec = latestPrefillTokPerSec,
+                        liveDecodeTokensPerSec = latestDecodeTokPerSec,
+                        liveDecodeTokenCount = latestDecodeCount,
+                        messages = updatedMessages,
+                        estimatedContextTokens = basePriorTokens + streamTokens
+                    )
+                }
+                return snapshot
+            }
+
             try {
                 engineCoordinator.generateStream(input).collect { event ->
                     when (event) {
                         is InferenceEvent.Started -> Unit
                         is InferenceEvent.PrefillCompleted -> {
-                            _uiState.update {
-                                it.copy(livePrefillTokensPerSec = event.prefillTokensPerSec)
-                            }
+                            latestPrefillTokPerSec = event.prefillTokensPerSec.takeIf { it.isFinite() } ?: 0.0
+                            applyBufferedStateToUi(
+                                isStreamingNow = true,
+                                isThinkingNow = currentlyThinking,
+                                isInterruptedNow = false
+                            )
                         }
                         is InferenceEvent.Token -> {
-                            _uiState.update { state ->
-                                val updatedMessages = state.messages.map { msg ->
-                                    if (msg.id == assistantMsgId) {
-                                        if (event.isThought) {
-                                            msg.copy(
-                                                thinkingText = msg.thinkingText + event.text,
-                                                isThinking = true
-                                            )
-                                        } else {
-                                            msg.copy(
-                                                text = msg.text + event.text,
-                                                isThinking = false
-                                            )
-                                        }
-                                    } else {
-                                        msg
-                                    }
-                                }
-                                state.copy(
-                                    liveDecodeTokensPerSec = event.currentDecodeTokPerSec,
-                                    liveDecodeTokenCount = event.decodeTokens,
-                                    messages = updatedMessages,
-                                    estimatedContextTokens = estimateTokenCount(updatedMessages)
+                            val phaseChanged = dirtyUi && (currentlyThinking != event.isThought)
+                            if (event.isThought) {
+                                thinkingBuffer.append(event.text)
+                            } else {
+                                answerBuffer.append(event.text)
+                            }
+                            currentlyThinking = event.isThought
+                            latestDecodeTokPerSec = event.currentDecodeTokPerSec.takeIf { it.isFinite() } ?: 0.0
+                            latestDecodeCount = event.decodeTokens
+                            dirtyUi = true
+
+                            val now = System.currentTimeMillis()
+                            if (phaseChanged || lastUiFlushMs == 0L || now - lastUiFlushMs >= 50L) {
+                                lastUiFlushMs = now
+                                dirtyUi = false
+                                applyBufferedStateToUi(
+                                    isStreamingNow = true,
+                                    isThinkingNow = currentlyThinking,
+                                    isInterruptedNow = false
                                 )
+                            }
+                            if (now - lastDbCheckpointMs >= 750L &&
+                                (thinkingBuffer.isNotEmpty() || answerBuffer.isNotEmpty()) &&
+                                checkpointJob?.isActive != true
+                            ) {
+                                lastDbCheckpointMs = now
+                                val textSnapshot = answerBuffer.toString()
+                                val thinkingSnapshot = thinkingBuffer.toString()
+                                checkpointJob = viewModelScope.launch(Dispatchers.IO) {
+                                    chatHistoryRepository.checkpointStreamingMessage(
+                                        threadId = threadId,
+                                        messageId = assistantMsgId,
+                                        text = textSnapshot,
+                                        thinkingText = thinkingSnapshot,
+                                        isInterrupted = true
+                                    )
+                                }
                             }
                         }
                         is InferenceEvent.Completed -> {
+                            checkpointJob?.join()
                             needsEngineResync = false
+                            val safeTelemetry = event.telemetry.copy(
+                                prefillTokensPerSec = event.telemetry.prefillTokensPerSec.takeIf { it.isFinite() } ?: 0.0,
+                                decodeTokensPerSec = event.telemetry.decodeTokensPerSec.takeIf { it.isFinite() } ?: 0.0
+                            )
+                            latestPrefillTokPerSec = safeTelemetry.prefillTokensPerSec
+                            latestDecodeTokPerSec = safeTelemetry.decodeTokensPerSec
+                            latestDecodeCount = safeTelemetry.decodeTokens
+
+                            val finalThinking = thinkingBuffer.toString()
+                            val finalAnswer = answerBuffer.toString()
                             var completedMsg: ChatMessageUi? = null
                             _uiState.update { state ->
                                 val updatedMessages = state.messages.map { msg ->
                                     if (msg.id == assistantMsgId) {
                                         msg.copy(
+                                            thinkingText = finalThinking,
+                                            text = finalAnswer,
                                             isStreaming = false,
                                             isThinking = false,
-                                            telemetry = event.telemetry,
+                                            isInterrupted = false,
+                                            telemetry = safeTelemetry,
                                             citations = citations
                                         ).also { completedMsg = it }
                                     } else {
@@ -1109,65 +1233,109 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                                     }
                                 }
                                 state.copy(
-                                    liveDecodeTokensPerSec = event.telemetry.decodeTokensPerSec,
-                                    livePrefillTokensPerSec = event.telemetry.prefillTokensPerSec,
+                                    liveDecodeTokensPerSec = safeTelemetry.decodeTokensPerSec,
+                                    livePrefillTokensPerSec = safeTelemetry.prefillTokensPerSec,
+                                    liveDecodeTokenCount = safeTelemetry.decodeTokens,
                                     messages = updatedMessages,
-                                    estimatedContextTokens = estimateTokenCount(updatedMessages)
+                                    estimatedContextTokens = basePriorTokens + (finalAnswer.length + finalThinking.length) / 4
                                 )
                             }
                             completedMsg?.let { msgToPersist ->
-                                chatHistoryRepository.saveMessage(
-                                    threadId = threadId,
-                                    message = msgToPersist,
-                                    turnOrder = assistantTurnOrder,
-                                    branchGroupId = assistantBranchGroupId,
-                                    revisionIndex = assistantRevisionIndex,
-                                    isActiveBranch = true
-                                )
+                                withContext(Dispatchers.IO + NonCancellable) {
+                                    chatHistoryRepository.saveMessage(
+                                        threadId = threadId,
+                                        message = msgToPersist,
+                                        turnOrder = assistantTurnOrder,
+                                        branchGroupId = assistantBranchGroupId,
+                                        revisionIndex = assistantRevisionIndex,
+                                        isActiveBranch = true
+                                    )
+                                }
                             }
                             refreshMemoryStatsNow()
                         }
                         is InferenceEvent.Error -> {
-                            var errorMsg: ChatMessageUi? = null
-                            _uiState.update { state ->
-                                val updatedMessages = state.messages.map { msg ->
-                                    if (msg.id == assistantMsgId) {
-                                        msg.copy(
-                                            text = if (msg.text.isEmpty()) "[Error] ${event.message}" else msg.text,
-                                            isStreaming = false,
-                                            isThinking = false
-                                        ).also { errorMsg = it }
-                                    } else {
-                                        msg
+                            checkpointJob?.join()
+                            needsEngineResync = true
+                            val hasPartial = thinkingBuffer.isNotBlank() || answerBuffer.isNotBlank()
+                            val errorMsg = applyBufferedStateToUi(
+                                isStreamingNow = false,
+                                isThinkingNow = false,
+                                isInterruptedNow = true,
+                                fallbackErrorIfBlank = event.message
+                            )
+                            _uiState.update { it.copy(statusBanner = event.message) }
+                            errorMsg?.let { msgToPersist ->
+                                if (hasPartial || msgToPersist.text.isNotBlank()) {
+                                    withContext(Dispatchers.IO + NonCancellable) {
+                                        chatHistoryRepository.saveMessage(
+                                            threadId = threadId,
+                                            message = msgToPersist,
+                                            turnOrder = assistantTurnOrder,
+                                            branchGroupId = assistantBranchGroupId,
+                                            revisionIndex = assistantRevisionIndex,
+                                            isActiveBranch = true
+                                        )
                                     }
                                 }
-                                state.copy(
-                                    statusBanner = event.message,
-                                    messages = updatedMessages
-                                )
-                            }
-                            errorMsg?.let { msgToPersist ->
-                                chatHistoryRepository.saveMessage(
-                                    threadId = threadId,
-                                    message = msgToPersist,
-                                    turnOrder = assistantTurnOrder,
-                                    branchGroupId = assistantBranchGroupId,
-                                    revisionIndex = assistantRevisionIndex,
-                                    isActiveBranch = true
-                                )
                             }
                         }
                     }
                 }
             } catch (e: CancellationException) {
-                finalizeAndPersistStreamingMessage(
-                    threadId = threadId,
-                    messageId = assistantMsgId,
-                    turnOrder = assistantTurnOrder,
-                    branchGroupId = assistantBranchGroupId,
-                    revisionIndex = assistantRevisionIndex
-                )
+                withContext(Dispatchers.IO + NonCancellable) {
+                    checkpointJob?.join()
+                    val cancelledMsg = applyBufferedStateToUi(
+                        isStreamingNow = false,
+                        isThinkingNow = false,
+                        isInterruptedNow = thinkingBuffer.isNotBlank() || answerBuffer.isNotBlank()
+                    )
+                    if (cancelledMsg != null && (cancelledMsg.text.isNotBlank() || cancelledMsg.thinkingText.isNotBlank())) {
+                        chatHistoryRepository.saveMessage(
+                            threadId = threadId,
+                            message = cancelledMsg,
+                            turnOrder = assistantTurnOrder,
+                            branchGroupId = assistantBranchGroupId,
+                            revisionIndex = assistantRevisionIndex,
+                            isActiveBranch = true
+                        )
+                    } else {
+                        chatHistoryRepository.deleteMessage(assistantMsgId)
+                        _uiState.update { state ->
+                            val cleaned = state.messages.filterNot { it.id == assistantMsgId }
+                            state.copy(
+                                messages = cleaned,
+                                estimatedContextTokens = estimateTokenCount(cleaned)
+                            )
+                        }
+                    }
+                }
                 throw e
+            } catch (t: Throwable) {
+                withContext(Dispatchers.IO + NonCancellable) {
+                    checkpointJob?.join()
+                    needsEngineResync = true
+                    val errText = t.message ?: "Unexpected generation interruption"
+                    val interruptedMsg = applyBufferedStateToUi(
+                        isStreamingNow = false,
+                        isThinkingNow = false,
+                        isInterruptedNow = true,
+                        fallbackErrorIfBlank = errText
+                    )
+                    _uiState.update { it.copy(statusBanner = errText) }
+                    if (interruptedMsg != null && (interruptedMsg.text.isNotBlank() || interruptedMsg.thinkingText.isNotBlank())) {
+                        chatHistoryRepository.saveMessage(
+                            threadId = threadId,
+                            message = interruptedMsg,
+                            turnOrder = assistantTurnOrder,
+                            branchGroupId = assistantBranchGroupId,
+                            revisionIndex = assistantRevisionIndex,
+                            isActiveBranch = true
+                        )
+                    } else {
+                        chatHistoryRepository.deleteMessage(assistantMsgId)
+                    }
+                }
             }
         }
     }
@@ -1175,7 +1343,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
     fun stopGeneration() {
         viewModelScope.launch {
             engineCoordinator.cancelGeneration()
-            generationJob?.cancel()
+            generationJob?.cancelAndJoin()
             val threadId = _uiState.value.activeThreadId
             val streamingMsg = _uiState.value.messages.lastOrNull { it.isStreaming }
             if (streamingMsg != null && threadId != null) {
@@ -1275,21 +1443,27 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             state.copy(
                 messages = state.messages.map { msg ->
                     if (msg.id == messageId) {
-                        msg.copy(isStreaming = false, isThinking = false).also { finalized = it }
+                        msg.copy(
+                            isStreaming = false,
+                            isThinking = false,
+                            isInterrupted = msg.text.isNotBlank() || msg.thinkingText.isNotBlank()
+                        ).also { finalized = it }
                     } else msg
                 }
             )
         }
         finalized?.let { msg ->
             if (msg.text.isNotBlank() || msg.thinkingText.isNotBlank()) {
-                chatHistoryRepository.saveMessage(
-                    threadId = threadId,
-                    message = msg,
-                    turnOrder = turnOrder,
-                    branchGroupId = branchGroupId,
-                    revisionIndex = revisionIndex,
-                    isActiveBranch = true
-                )
+                withContext(Dispatchers.IO + NonCancellable) {
+                    chatHistoryRepository.saveMessage(
+                        threadId = threadId,
+                        message = msg,
+                        turnOrder = turnOrder,
+                        branchGroupId = branchGroupId,
+                        revisionIndex = revisionIndex,
+                        isActiveBranch = true
+                    )
+                }
             }
         }
     }

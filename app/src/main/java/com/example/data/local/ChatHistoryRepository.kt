@@ -1,5 +1,6 @@
 package com.example.data.local
 
+import androidx.compose.runtime.Immutable
 import com.example.data.storage.SystemPromptPresets
 import com.example.domain.engine.GenerationTelemetry
 import com.example.ui.viewmodel.ChatMessageUi
@@ -10,6 +11,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.UUID
 
+@Immutable
 @Serializable
 data class DocumentCitationUi(
     val documentId: String,
@@ -18,6 +20,7 @@ data class DocumentCitationUi(
     val snippet: String
 )
 
+@Immutable
 data class SlashCommandItem(
     val id: String,
     val trigger: String,
@@ -38,6 +41,7 @@ class ChatHistoryRepository(
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
+        allowSpecialFloatingPointValues = true
     }
 
     private val workspaceDao = database.workspaceDao()
@@ -203,8 +207,21 @@ class ChatHistoryRepository(
         revisionIndex: Int = 0,
         isActiveBranch: Boolean = true
     ) {
+        if (threadDao.getById(threadId) == null) return
         if (isActiveBranch) {
             messageDao.deactivateBranchesInGroup(threadId, branchGroupId)
+        }
+        val safeTelemetry = message.telemetry?.let { t ->
+            t.copy(
+                prefillTokensPerSec = t.prefillTokensPerSec.takeIf { it.isFinite() } ?: 0.0,
+                decodeTokensPerSec = t.decodeTokensPerSec.takeIf { it.isFinite() } ?: 0.0
+            )
+        }
+        val encodedCitations = message.citations.takeIf { it.isNotEmpty() }?.let { list ->
+            runCatching { json.encodeToString(list) }.getOrNull()
+        }
+        val encodedTelemetry = safeTelemetry?.let { t ->
+            runCatching { json.encodeToString(t) }.getOrNull()
         }
         val entity = ChatMessageEntity(
             id = message.id,
@@ -217,12 +234,34 @@ class ChatHistoryRepository(
             text = message.text,
             thinkingText = message.thinkingText,
             imageUriString = message.imageUriString,
-            citationsJson = message.citations.takeIf { it.isNotEmpty() }?.let { json.encodeToString(it) },
-            telemetryJson = message.telemetry?.let { json.encodeToString(it) },
+            citationsJson = encodedCitations,
+            telemetryJson = encodedTelemetry,
+            isInterrupted = message.isInterrupted,
             timestampMillis = message.timestampMillis
         )
-        messageDao.upsert(entity)
-        threadDao.touchUpdatedAt(threadId, System.currentTimeMillis())
+        runCatching {
+            messageDao.upsert(entity)
+            threadDao.touchUpdatedAt(threadId, System.currentTimeMillis())
+        }
+    }
+
+    suspend fun checkpointStreamingMessage(
+        threadId: String,
+        messageId: String,
+        text: String,
+        thinkingText: String,
+        isInterrupted: Boolean = true
+    ) {
+        runCatching {
+            messageDao.updateStreamingCheckpoint(
+                id = messageId,
+                text = text,
+                thinkingText = thinkingText,
+                isInterrupted = isInterrupted,
+                timestampMillis = System.currentTimeMillis()
+            )
+            threadDao.touchUpdatedAt(threadId, System.currentTimeMillis())
+        }
     }
 
     suspend fun selectBranch(threadId: String, branchGroupId: String, targetMessageId: String) {
@@ -274,6 +313,7 @@ class ChatHistoryRepository(
                 isThinking = false,
                 imageUriString = active.imageUriString,
                 isStreaming = false,
+                isInterrupted = active.isInterrupted,
                 telemetry = telemetry,
                 timestampMillis = active.timestampMillis,
                 turnOrder = active.turnOrder,

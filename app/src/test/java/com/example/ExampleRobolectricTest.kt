@@ -38,6 +38,8 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import androidx.compose.ui.test.performClick
+import android.content.ComponentCallbacks2
+import com.example.data.engine.MemoryPressureWarning
 import com.example.data.hub.HfLfsMeta
 import com.example.data.hub.HfRepoSummary
 import com.example.data.hub.HfTreeApiItem
@@ -51,9 +53,11 @@ import com.example.data.local.WorkspaceEntity
 import com.example.data.rag.LocalRagRepository
 import com.example.data.rag.PdfTextExtractor
 import com.example.data.voice.VoiceController
+import com.example.domain.engine.GenerationTelemetry
 import com.example.ui.screens.ThreadsHubScreen
 import com.example.ui.viewmodel.HubBrowserState
 import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertNull
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.zip.Deflater
@@ -600,5 +604,115 @@ class ExampleRobolectricTest {
         composeRule.onNodeWithTag("markdown_code_block").assertExists()
         composeRule.onNodeWithTag("citation_chip_0").assertExists()
         composeRule.onNodeWithTag("context_window_gauge_pill").assertExists()
+    }
+
+    @Test
+    fun `checkpointStreamingMessage retains partial thinking and answer with interrupted flag and sanitizes non-finite telemetry`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = LocalMindDatabase.createInMemory(context)
+        try {
+            val repo = ChatHistoryRepository(db)
+            val thread = repo.ensureSeededAndGetInitialThread()
+
+            val initial = ChatMessageUi(
+                id = "a_partial",
+                role = ChatRole.ASSISTANT,
+                text = "",
+                thinkingText = "",
+                isInterrupted = true,
+                telemetry = GenerationTelemetry(
+                    prefillTokens = 12,
+                    prefillTimeMs = 10L,
+                    prefillTokensPerSec = Double.POSITIVE_INFINITY,
+                    decodeTokens = 4,
+                    decodeTimeMs = 0L,
+                    decodeTokensPerSec = Double.NaN,
+                    activeAccelerator = HardwareAccelerator.CPU,
+                    backendLabel = "llama.cpp",
+                    thoughtTokens = 4
+                ),
+                turnOrder = 0,
+                branchGroupId = "grp_partial"
+            )
+            repo.saveMessage(thread.id, initial, turnOrder = 0, branchGroupId = "grp_partial")
+
+            repo.checkpointStreamingMessage(
+                threadId = thread.id,
+                messageId = "a_partial",
+                text = "Partial answer so far",
+                thinkingText = "Reasoning trace before crash",
+                isInterrupted = true
+            )
+
+            val loaded = repo.loadActiveBranchMessages(thread.id)
+            assertEquals(1, loaded.size)
+            assertEquals("Partial answer so far", loaded.first().text)
+            assertEquals("Reasoning trace before crash", loaded.first().thinkingText)
+            assertTrue(loaded.first().isInterrupted)
+            assertEquals(0.0, loaded.first().telemetry?.prefillTokensPerSec ?: -1.0, 0.001)
+            assertEquals(0.0, loaded.first().telemetry?.decodeTokensPerSec ?: -1.0, 0.001)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `chat screen renders interrupted badge and warn-first low memory banner`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val coordinator = InferenceEngineCoordinator(
+            context = context,
+            liteRtEngine = LiteRtEngineImpl(context, ImagePreprocessor(context)),
+            llamaCppEngine = LlamaCppEngineImpl(context)
+        )
+        coordinator.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN)
+        assertNull(coordinator.memoryPressureWarning.value)
+
+        var dismissed = false
+        composeRule.setContent {
+            LocalMindTheme(darkTheme = true) {
+                ChatScreen(
+                    uiState = LocalMindUiState(
+                        memoryPressureWarning = MemoryPressureWarning(
+                            level = ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL,
+                            severityLabel = "Critical low memory",
+                            availableRamMb = 412L,
+                            totalRamMb = 8192L
+                        ),
+                        messages = listOf(
+                            ChatMessageUi(role = ChatRole.USER, text = "Explain KV cache", turnOrder = 0),
+                            ChatMessageUi(
+                                id = "a_interrupted",
+                                role = ChatRole.ASSISTANT,
+                                text = "Partial reply retained...",
+                                thinkingText = "Checking memory pressure",
+                                isStreaming = false,
+                                isInterrupted = true,
+                                turnOrder = 1
+                            )
+                        )
+                    ),
+                    engineState = EngineLifecycleState.Idle,
+                    activeModel = null,
+                    onSendPrompt = {},
+                    onStopGeneration = {},
+                    onResetConversation = {},
+                    onRegenerateLastResponse = {},
+                    onEditLastUserMessage = {},
+                    onDeleteMessage = {},
+                    onBuildMarkdownTranscript = { "" },
+                    onShowStatusBanner = {},
+                    onAttachImageUri = {},
+                    onClearPendingImage = {},
+                    onToggleThinking = {},
+                    onOpenModelVault = {},
+                    onOpenTelemetrySheet = {},
+                    onDismissMemoryWarning = { dismissed = true }
+                )
+            }
+        }
+        composeRule.onNodeWithTag("interrupted_badge").assertExists()
+        composeRule.onNodeWithTag("low_memory_warning_banner").assertExists()
+        composeRule.onNodeWithTag("memory_warning_dismiss_button").performClick()
+        assertTrue(dismissed)
     }
 }

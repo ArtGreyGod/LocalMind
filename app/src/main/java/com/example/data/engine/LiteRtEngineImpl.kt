@@ -362,30 +362,41 @@ class LiteRtEngineImpl(
                             }
                         }
 
-                        lmHistory.add(promptMessage)
                         val answerStr = collectedAnswer.toString()
                         val thoughtStr = collectedThought.toString()
-                        val channelsMap = if (thoughtStr.isNotEmpty()) mapOf("thought" to thoughtStr) else emptyMap()
-                        lmHistory.add(
-                            Message.model(
-                                contents = Contents.of(answerStr),
-                                channels = channelsMap
-                            )
-                        )
+                        if (answerStr.isNotEmpty() || thoughtStr.isNotEmpty()) {
+                            runCatching {
+                                lmHistory.add(promptMessage)
+                                val channelsMap = if (thoughtStr.isNotEmpty()) mapOf("thought" to thoughtStr) else emptyMap()
+                                val safeAnswer = answerStr.ifEmpty { " " }
+                                lmHistory.add(
+                                    Message.model(
+                                        contents = Contents.of(safeAnswer),
+                                        channels = channelsMap
+                                    )
+                                )
+                            }.onFailure { err ->
+                                Log.w(TAG, "Failed to append LiteRT-LM history on turn completion", err)
+                            }
+                        }
 
                         val endNs = System.nanoTime()
                         val prefillMs = max(1L, ((firstTokenNs ?: endNs) - startNs) / 1_000_000L)
                         val decodeMs = max(1L, (endNs - (firstTokenNs ?: endNs)) / 1_000_000L)
                         estimatedTurnsTokens += approxPromptTokens + decodeTokens
+                        val safePrefillTps = (approxPromptTokens * 1000.0 / prefillMs).takeIf { it.isFinite() } ?: 0.0
+                        val safeDecodeTps = if (decodeTokens > 0) {
+                            (decodeTokens * 1000.0 / decodeMs).takeIf { it.isFinite() } ?: 0.0
+                        } else 0.0
                         trySend(
                             InferenceEvent.Completed(
                                 GenerationTelemetry(
                                     prefillTokens = approxPromptTokens,
                                     prefillTimeMs = prefillMs,
-                                    prefillTokensPerSec = approxPromptTokens * 1000.0 / prefillMs,
+                                    prefillTokensPerSec = safePrefillTps,
                                     decodeTokens = decodeTokens,
                                     decodeTimeMs = decodeMs,
-                                    decodeTokensPerSec = if (decodeTokens > 0) decodeTokens * 1000.0 / decodeMs else 0.0,
+                                    decodeTokensPerSec = safeDecodeTps,
                                     activeAccelerator = info.activeAccelerator,
                                     backendLabel = info.backendDescription,
                                     thoughtTokens = thoughtTokens
@@ -450,12 +461,12 @@ class LiteRtEngineImpl(
                     ModelFormat.GGUF -> Unit
                 }
             } catch (e: CancellationException) {
-                lmConversation?.cancelProcess()
+                runCatching { lmConversation?.cancelProcess() }
                 throw e
             } catch (oom: OutOfMemoryError) {
                 trySend(InferenceEvent.Error("Out of memory during LiteRT inference: ${oom.message}", recoverable = false))
-            } catch (e: Exception) {
-                trySend(InferenceEvent.Error(e.message ?: "LiteRT inference failed", recoverable = true))
+            } catch (t: Throwable) {
+                trySend(InferenceEvent.Error(t.message ?: "LiteRT inference failed", recoverable = true))
             } finally {
                 isGenerating = false
                 if (activeInfo != null) {
@@ -536,18 +547,9 @@ class LiteRtEngineImpl(
         )
     }
 
-    @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
-            level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE
-        ) {
-            Log.w(TAG, "onTrimMemory($level): releasing LiteRT native buffers")
-            engineScope.launch {
-                mutex.withLock {
-                    releaseInternalLocked()
-                }
-            }
-        }
+        // Warn-first policy handled by InferenceEngineCoordinator; never silently unload mid-chat.
+        Log.i(TAG, "onTrimMemory($level): retaining loaded LiteRT model per warn-first policy")
     }
 
     private fun tryInitLiteRtLm(

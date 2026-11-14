@@ -121,7 +121,9 @@ class LlamaCppEngineImpl(
 
     private val json = Json { ignoreUnknownKeys = true }
     private val engineExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "LocalMind-LlamaCpp-Worker").apply { isDaemon = true }
+        Thread(null, runnable, "LocalMind-LlamaCpp-Worker", 4L * 1024L * 1024L).apply {
+            isDaemon = true
+        }
     }
     private val engineDispatcher = engineExecutor.asCoroutineDispatcher()
     private val engineScope = CoroutineScope(SupervisorJob() + engineDispatcher)
@@ -259,7 +261,7 @@ class LlamaCppEngineImpl(
                     prefillMsRecorded = max(1L, prefillTimeMs)
                     decodeStartNs[0] = System.nanoTime()
                     thinkingParser = ThinkingStreamParser(startInThought = startsInThought)
-                    val tps = prefillTokens * 1000.0 / prefillMsRecorded
+                    val tps = (prefillTokens * 1000.0 / prefillMsRecorded).takeIf { it.isFinite() } ?: 0.0
                     trySend(
                         InferenceEvent.PrefillCompleted(
                             prefillTokens = prefillTokens,
@@ -273,7 +275,7 @@ class LlamaCppEngineImpl(
                     if (tokenText.isEmpty()) return
                     decodeTokens++
                     val elapsedDecodeMs = max(1L, (System.nanoTime() - decodeStartNs[0]) / 1_000_000L)
-                    val curTps = decodeTokens * 1000.0 / elapsedDecodeMs
+                    val curTps = (decodeTokens * 1000.0 / elapsedDecodeMs).takeIf { it.isFinite() } ?: 0.0
                     val chunks = thinkingParser.feed(tokenText)
                     for (chunk in chunks) {
                         if (chunk.isThought) {
@@ -294,7 +296,9 @@ class LlamaCppEngineImpl(
                 override fun onCompleted(decodeTokens: Int, decodeTimeMs: Long) {
                     val safeDecodeMs = max(1L, decodeTimeMs)
                     val remaining = thinkingParser.flush()
-                    val curTps = if (decodeTokens > 0) decodeTokens * 1000.0 / safeDecodeMs else 0.0
+                    val curTps = if (decodeTokens > 0) {
+                        (decodeTokens * 1000.0 / safeDecodeMs).takeIf { it.isFinite() } ?: 0.0
+                    } else 0.0
                     for (chunk in remaining) {
                         if (chunk.isThought) {
                             thoughtTokens++
@@ -309,7 +313,7 @@ class LlamaCppEngineImpl(
                             )
                         )
                     }
-                    val prefillTps = prefillTokensRecorded * 1000.0 / prefillMsRecorded
+                    val prefillTps = (prefillTokensRecorded * 1000.0 / prefillMsRecorded).takeIf { it.isFinite() } ?: 0.0
                     trySend(
                         InferenceEvent.Completed(
                             GenerationTelemetry(
@@ -349,10 +353,12 @@ class LlamaCppEngineImpl(
                 if (rc != 0 && !errorEmitted) {
                     trySend(InferenceEvent.Error("Native generation returned status $rc", recoverable = true))
                 }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                throw ce
             } catch (oom: OutOfMemoryError) {
                 trySend(InferenceEvent.Error("Out of memory in llama.cpp: ${oom.message}", recoverable = false))
-            } catch (e: Exception) {
-                trySend(InferenceEvent.Error(e.message ?: "llama.cpp generation error", recoverable = true))
+            } catch (t: Throwable) {
+                trySend(InferenceEvent.Error(t.message ?: "llama.cpp generation error", recoverable = true))
             } finally {
                 isGenerating = false
                 if (activeInfo != null) {
@@ -428,19 +434,8 @@ class LlamaCppEngineImpl(
     }
 
     override fun onTrimMemory(level: Int) {
-        if (level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
-            level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE
-        ) {
-            Log.w(TAG, "onTrimMemory($level): unloading llama.cpp native buffers")
-            if (LlamaCppNativeBridge.isLibraryLoaded) {
-                LlamaCppNativeBridge.nativeCancelGeneration()
-            }
-            engineScope.launch {
-                mutex.withLock {
-                    releaseInternalLocked()
-                }
-            }
-        }
+        // Warn-first policy handled by InferenceEngineCoordinator; never silently unload mid-chat.
+        Log.i(TAG, "onTrimMemory($level): retaining loaded llama.cpp model per warn-first policy")
     }
 
     private fun releaseInternalLocked() {

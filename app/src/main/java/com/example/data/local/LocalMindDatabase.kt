@@ -14,6 +14,8 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import androidx.room.Update
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Entity(tableName = "workspaces")
@@ -77,6 +79,7 @@ data class ChatMessageEntity(
     val imageUriString: String? = null,
     val citationsJson: String? = null,
     val telemetryJson: String? = null,
+    val isInterrupted: Boolean = false,
     val timestampMillis: Long = System.currentTimeMillis()
 )
 
@@ -197,6 +200,17 @@ interface ChatMessageDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(messages: List<ChatMessageEntity>)
 
+    @Query(
+        "UPDATE chat_messages SET text = :text, thinkingText = :thinkingText, isInterrupted = :isInterrupted, timestampMillis = :timestampMillis WHERE id = :id"
+    )
+    suspend fun updateStreamingCheckpoint(
+        id: String,
+        text: String,
+        thinkingText: String,
+        isInterrupted: Boolean,
+        timestampMillis: Long
+    )
+
     @Query("UPDATE chat_messages SET isActiveBranch = 0 WHERE threadId = :threadId AND branchGroupId = :groupId")
     suspend fun deactivateBranchesInGroup(threadId: String, groupId: String)
 
@@ -273,7 +287,7 @@ interface PromptTemplateDao {
         DocumentChunkEntity::class,
         PromptTemplateEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class LocalMindDatabase : RoomDatabase() {
@@ -284,12 +298,22 @@ abstract class LocalMindDatabase : RoomDatabase() {
     abstract fun promptTemplateDao(): PromptTemplateDao
 
     companion object {
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE chat_messages ADD COLUMN isInterrupted INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
         fun create(context: Context): LocalMindDatabase {
             return Room.databaseBuilder(
                 context.applicationContext,
                 LocalMindDatabase::class.java,
                 "localmind_studio.db"
-            ).build()
+            )
+                .addMigrations(MIGRATION_1_2)
+                .build()
         }
 
         fun createInMemory(context: Context): LocalMindDatabase {
