@@ -1,0 +1,10 @@
+{
+  "name": "LocalMind",
+  "description": "100% on-device local LLM & Vision-Language workbench supporting LiteRT-LM, LiteRT CompiledModel, and llama.cpp GGUF/mmproj inference.",
+  "requestFramePermissions": [
+    "CAMERA"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

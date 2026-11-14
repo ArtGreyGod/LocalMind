@@ -1,0 +1,953 @@
+#include <android/log.h>
+#include <jni.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "chat.h"
+#include "common.h"
+#include "ggml.h"
+#include "llama.h"
+#include "mtmd-helper.h"
+#include "mtmd.h"
+#include "sampling.h"
+
+#define TAG "LocalMindLlamaJNI"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+namespace {
+
+constexpr int kDefaultBatchSize = 512;
+constexpr int kOverflowHeadroom = 16;
+
+struct EngineSession {
+    llama_model * model = nullptr;
+    llama_context * ctx = nullptr;
+    common_sampler * sampler = nullptr;
+    common_chat_templates_ptr chat_templates;
+    mtmd_context * mtmd_ctx = nullptr;
+
+    std::vector<common_chat_msg> chat_history;
+    llama_pos current_pos = 0;
+    llama_pos system_prompt_pos = 0;
+    llama_pos prev_turn_pos = 0;
+    size_t prev_history_size = 0;
+    bool can_rollback = false;
+    int32_t n_ctx = 4096;
+    int32_t n_threads = 4;
+    int32_t n_gpu_layers = 0;
+    bool system_prompt_applied = false;
+    std::string active_backend_label = "CPU (NEON/dotprod)";
+};
+
+std::mutex g_engine_mutex;
+std::mutex g_log_mutex;
+std::string g_last_error_msg;
+std::atomic<bool> g_cancel_requested{false};
+std::atomic<bool> g_backend_initialized{false};
+EngineSession g_session;
+
+void clear_last_error() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_last_error_msg.clear();
+}
+
+std::string get_last_error() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    return g_last_error_msg;
+}
+
+void android_llama_log_callback(ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (!text) return;
+    switch (level) {
+        case GGML_LOG_LEVEL_ERROR: {
+            LOGE("%s", text);
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            std::string line(text);
+            while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+                line.pop_back();
+            }
+            if (!line.empty()) {
+                g_last_error_msg = line;
+            }
+            break;
+        }
+        case GGML_LOG_LEVEL_WARN:
+            LOGW("%s", text);
+            break;
+        default:
+            break;
+    }
+}
+
+bool is_valid_utf8(const char * string) {
+    if (!string) return true;
+    const auto * bytes = reinterpret_cast<const unsigned char *>(string);
+    int num = 0;
+    while (*bytes != 0x00) {
+        if ((*bytes & 0x80) == 0x00) {
+            num = 1;
+        } else if ((*bytes & 0xE0) == 0xC0) {
+            num = 2;
+        } else if ((*bytes & 0xF0) == 0xE0) {
+            num = 3;
+        } else if ((*bytes & 0xF8) == 0xF0) {
+            num = 4;
+        } else {
+            return false;
+        }
+        bytes += 1;
+        for (int i = 1; i < num; ++i) {
+            if ((*bytes & 0xC0) != 0x80) return false;
+            bytes += 1;
+        }
+    }
+    return true;
+}
+
+std::string detect_active_backend(int32_t gpu_layers) {
+    std::vector<std::string> gpu_backends;
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        auto * reg = ggml_backend_reg_get(i);
+        if (!reg) continue;
+        std::string name = ggml_backend_reg_name(reg);
+        if (name != "CPU") {
+            gpu_backends.push_back(name);
+        }
+    }
+    if (gpu_layers > 0 && !gpu_backends.empty()) {
+        std::ostringstream oss;
+        for (size_t i = 0; i < gpu_backends.size(); ++i) {
+            if (i > 0) oss << "+";
+            oss << gpu_backends[i];
+        }
+        oss << " (" << gpu_layers << " layers) + CPU";
+        return oss.str();
+    }
+#if defined(__aarch64__)
+    return "CPU (ARMv8.2 NEON/dotprod)";
+#else
+    return "CPU";
+#endif
+}
+
+void reset_session_memory_locked() {
+    if (g_session.ctx) {
+        llama_memory_clear(llama_get_memory(g_session.ctx), true);
+    }
+    if (g_session.sampler) {
+        common_sampler_reset(g_session.sampler);
+    }
+    g_session.chat_history.clear();
+    g_session.current_pos = 0;
+    g_session.system_prompt_pos = 0;
+    g_session.prev_turn_pos = 0;
+    g_session.prev_history_size = 0;
+    g_session.can_rollback = false;
+    g_session.system_prompt_applied = false;
+}
+
+void free_session_locked() {
+    if (g_session.mtmd_ctx) {
+        mtmd_free(g_session.mtmd_ctx);
+        g_session.mtmd_ctx = nullptr;
+    }
+    if (g_session.sampler) {
+        common_sampler_free(g_session.sampler);
+        g_session.sampler = nullptr;
+    }
+    g_session.chat_templates.reset();
+    if (g_session.ctx) {
+        llama_free(g_session.ctx);
+        g_session.ctx = nullptr;
+    }
+    if (g_session.model) {
+        llama_model_free(g_session.model);
+        g_session.model = nullptr;
+    }
+    g_session.chat_history.clear();
+    g_session.current_pos = 0;
+    g_session.system_prompt_pos = 0;
+    g_session.prev_turn_pos = 0;
+    g_session.prev_history_size = 0;
+    g_session.can_rollback = false;
+    g_session.system_prompt_applied = false;
+}
+
+void shift_context_locked() {
+    if (!g_session.ctx || g_session.current_pos <= g_session.system_prompt_pos + 8) {
+        return;
+    }
+    const llama_pos n_discard = (g_session.current_pos - g_session.system_prompt_pos) / 2;
+    if (n_discard <= 0) return;
+    LOGW("KV cache near capacity (%d/%d). Shifting %d tokens.",
+         g_session.current_pos, g_session.n_ctx, n_discard);
+    llama_memory_t mem = llama_get_memory(g_session.ctx);
+    if (!llama_memory_seq_rm(mem, 0, g_session.system_prompt_pos, g_session.system_prompt_pos + n_discard)) {
+        LOGW("Mid-sequence KV shift unsupported on this architecture; clearing memory cleanly.");
+        reset_session_memory_locked();
+        return;
+    }
+    llama_memory_seq_add(mem, 0, g_session.system_prompt_pos + n_discard, g_session.current_pos, -n_discard);
+    g_session.current_pos -= n_discard;
+    g_session.can_rollback = false;
+}
+
+int decode_tokens_in_batches_locked(
+        const std::vector<llama_token> & tokens,
+        bool compute_last_logit) {
+    if (!g_session.ctx) return -1;
+    common_batch batch(g_session.ctx);
+    const int total = static_cast<int>(tokens.size());
+    for (int i = 0; i < total; i += kDefaultBatchSize) {
+        if (g_cancel_requested.load()) return -2;
+        const int cur_size = std::min(total - i, kDefaultBatchSize);
+        if (g_session.current_pos + cur_size >= g_session.n_ctx - kOverflowHeadroom) {
+            shift_context_locked();
+        }
+        batch.clear();
+        for (int j = 0; j < cur_size; ++j) {
+            const bool want_logit = compute_last_logit && (i + j == total - 1);
+            batch.add(tokens[i + j], g_session.current_pos + j, 0, want_logit);
+        }
+        if (llama_process(g_session.ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            LOGE("llama_process failed during batch decode");
+            return -3;
+        }
+        g_session.current_pos += cur_size;
+    }
+    return 0;
+}
+
+bool prompt_ends_inside_thinking(
+        const std::string & gen_prompt,
+        const std::string & tmpl_open_tag,
+        const std::vector<std::string> & tmpl_end_tags,
+        std::string * out_open_tag = nullptr,
+        std::string * out_close_tag = nullptr) {
+    struct TagPairDef {
+        std::string open;
+        std::string close;
+    };
+    std::vector<TagPairDef> pairs = {
+        {"<think>", "</think>"},
+        {"<thought>", "</thought>"},
+        {"<|thought|>", "<|end_thought|>"},
+        {"<reasoning>", "</reasoning>"},
+        {"<|channel>thought", "<channel|>"}
+    };
+    if (!tmpl_open_tag.empty()) {
+        std::string matched_close = "</think>";
+        for (const auto & end_tag : tmpl_end_tags) {
+            if (!end_tag.empty()) {
+                // Trim leading whitespace like "\n</think>"
+                size_t first_non_ws = end_tag.find_first_not_of(" \t\r\n");
+                matched_close = first_non_ws == std::string::npos ? end_tag : end_tag.substr(first_non_ws);
+                break;
+            }
+        }
+        pairs.insert(pairs.begin(), {tmpl_open_tag, matched_close});
+    }
+
+    size_t last_open_pos = std::string::npos;
+    std::string matched_open;
+    std::string matched_close = "</think>";
+    for (const auto & p : pairs) {
+        if (p.open.empty()) continue;
+        size_t pos = gen_prompt.rfind(p.open);
+        if (pos != std::string::npos && (last_open_pos == std::string::npos || pos > last_open_pos)) {
+            last_open_pos = pos;
+            matched_open = p.open;
+            matched_close = p.close;
+        }
+    }
+    if (last_open_pos == std::string::npos) {
+        return false;
+    }
+
+    size_t last_close_pos = std::string::npos;
+    for (const auto & p : pairs) {
+        if (p.close.empty()) continue;
+        size_t pos = gen_prompt.rfind(p.close);
+        if (pos != std::string::npos && (last_close_pos == std::string::npos || pos > last_close_pos)) {
+            last_close_pos = pos;
+        }
+    }
+    for (const auto & end_tag : tmpl_end_tags) {
+        if (end_tag.empty()) continue;
+        size_t pos = gen_prompt.rfind(end_tag);
+        if (pos != std::string::npos && (last_close_pos == std::string::npos || pos > last_close_pos)) {
+            last_close_pos = pos;
+        }
+    }
+
+    const bool unclosed = (last_close_pos == std::string::npos) || (last_open_pos > last_close_pos);
+    if (unclosed) {
+        if (out_open_tag) *out_open_tag = matched_open;
+        if (out_close_tag) *out_close_tag = matched_close;
+    }
+    return unclosed;
+}
+
+std::string format_turn_locked(
+        const std::string & role,
+        const std::string & content,
+        const std::string & system_prompt,
+        bool enable_thinking,
+        bool * out_starts_in_thinking = nullptr,
+        std::string * out_open_tag = nullptr,
+        std::string * out_close_tag = nullptr) {
+    common_chat_msg msg;
+    msg.role = role;
+    msg.content = content;
+    const bool has_template = common_chat_templates_was_explicit(g_session.chat_templates.get());
+    std::string formatted;
+
+    // On the very first user turn, attach the system message alongside the user message so
+    // templates that validate "user query must exist" (like Qwen3.5) succeed on Turn 1 and
+    // honor enable_thinking accurately.
+    std::vector<common_chat_msg> seed_history = g_session.chat_history;
+    bool seeded_system = false;
+    if (role == "user" && seed_history.empty() && !system_prompt.empty()) {
+        common_chat_msg sys_msg;
+        sys_msg.role = "system";
+        sys_msg.content = system_prompt;
+        seed_history.push_back(std::move(sys_msg));
+        seeded_system = true;
+    }
+
+    if (has_template) {
+        bool used_jinja = false;
+        try {
+            common_chat_templates_inputs past_inputs;
+            past_inputs.use_jinja = true;
+            past_inputs.enable_thinking = enable_thinking;
+            past_inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+
+            std::string fmt_past;
+            if (!g_session.chat_history.empty()) {
+                past_inputs.messages = g_session.chat_history;
+                past_inputs.add_generation_prompt = false;
+                fmt_past = common_chat_templates_apply(g_session.chat_templates.get(), past_inputs).prompt.str();
+            }
+
+            common_chat_templates_inputs new_inputs;
+            new_inputs.use_jinja = true;
+            new_inputs.enable_thinking = enable_thinking;
+            new_inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+            new_inputs.messages = seed_history;
+            new_inputs.messages.push_back(msg);
+            new_inputs.add_generation_prompt = (role == "user");
+
+            const auto chat_params = common_chat_templates_apply(g_session.chat_templates.get(), new_inputs);
+            const std::string fmt_new = chat_params.prompt.str();
+
+            if (seeded_system || g_session.chat_history.empty()) {
+                formatted = fmt_new;
+                used_jinja = true;
+            } else if (fmt_new.size() >= fmt_past.size() && fmt_new.rfind(fmt_past, 0) == 0) {
+                formatted = fmt_new.substr(fmt_past.size());
+                used_jinja = true;
+            } else if (role == "user") {
+                // Multi-turn templates (like Qwen3.5) strip <think>...</think> from prior turns
+                // once a new user query is appended, causing fmt_new != fmt_past + suffix.
+                // Diff against a probe user message to isolate the exact new user turn + gen prompt.
+                common_chat_templates_inputs probe_inputs = new_inputs;
+                probe_inputs.messages.back().content = "__LOCALMIND_TURN_PROBE__";
+                const std::string fmt_probe = common_chat_templates_apply(
+                        g_session.chat_templates.get(), probe_inputs).prompt.str();
+                size_t diff_pos = 0;
+                const size_t min_len = std::min(fmt_new.size(), fmt_probe.size());
+                while (diff_pos < min_len && fmt_new[diff_pos] == fmt_probe[diff_pos]) {
+                    diff_pos++;
+                }
+                size_t turn_start = std::string::npos;
+                for (const auto & delim : chat_params.message_delimiters.delimiters) {
+                    if (delim.role == COMMON_CHAT_ROLE_USER && !delim.delimiter.empty()) {
+                        size_t pos = fmt_new.rfind(delim.delimiter, diff_pos);
+                        if (pos != std::string::npos && (turn_start == std::string::npos || pos > turn_start)) {
+                            turn_start = pos;
+                        }
+                    }
+                }
+                if (turn_start == std::string::npos) {
+                    size_t pos = fmt_new.rfind("<|im_start|>user", diff_pos);
+                    if (pos == std::string::npos) pos = fmt_new.rfind("<|turn>user", diff_pos);
+                    turn_start = pos;
+                }
+                if (turn_start != std::string::npos) {
+                    formatted = fmt_new.substr(turn_start);
+                    used_jinja = true;
+                }
+            }
+
+            if (used_jinja && out_starts_in_thinking != nullptr && role == "user") {
+                const std::string & gen_prompt = chat_params.generation_prompt;
+                *out_starts_in_thinking = prompt_ends_inside_thinking(
+                        gen_prompt,
+                        chat_params.thinking_start_tag,
+                        chat_params.thinking_end_tags,
+                        out_open_tag,
+                        out_close_tag);
+            }
+        } catch (const std::exception & e) {
+            LOGW("Jinja chat template fallback: %s", e.what());
+        }
+
+        if (!used_jinja) {
+            formatted = common_chat_format_single(
+                    g_session.chat_templates.get(),
+                    seed_history,
+                    msg,
+                    role == "user",
+                    /* use_jinja */ false);
+        }
+    } else {
+        if (seeded_system) {
+            formatted = "<<SYS>>\n" + system_prompt + "\n<</SYS>>\n\n";
+        }
+        if (role == "system") {
+            formatted += "<<SYS>>\n" + content + "\n<</SYS>>\n\n";
+        } else if (role == "user") {
+            formatted += "User: " + content + "\nAssistant: ";
+        } else {
+            formatted += content + "\n";
+        }
+    }
+    if (seeded_system) {
+        g_session.chat_history = std::move(seed_history);
+    }
+    g_session.chat_history.push_back(std::move(msg));
+    return formatted;
+}
+
+} // namespace
+
+extern "C" {
+
+JNIEXPORT void JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeInit(
+        JNIEnv * /*env*/,
+        jobject /*thiz*/) {
+    if (!g_backend_initialized.exchange(true)) {
+        llama_log_set(android_llama_log_callback, nullptr);
+        mtmd_helper_log_set(android_llama_log_callback, nullptr);
+        llama_backend_init();
+        LOGI("llama_backend_init completed");
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeLoadModel(
+        JNIEnv * env,
+        jobject /*thiz*/,
+        jstring jModelPath,
+        jstring jMmprojPath,
+        jint nCtx,
+        jint nThreads,
+        jint nGpuLayers,
+        jfloat temperature,
+        jfloat topP,
+        jint topK) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    g_cancel_requested.store(false);
+    clear_last_error();
+    free_session_locked();
+
+    const char * model_path = env->GetStringUTFChars(jModelPath, nullptr);
+    if (!model_path) return -1;
+
+    llama_model_params mparams = llama_model_default_params();
+    mparams.n_gpu_layers = std::max<int32_t>(0, nGpuLayers);
+
+    LOGI("Loading GGUF model: %s (gpu_layers=%d)", model_path, mparams.n_gpu_layers);
+    llama_model * model = llama_model_load_from_file(model_path, mparams);
+    env->ReleaseStringUTFChars(jModelPath, model_path);
+
+    if (!model) {
+        LOGE("Failed to load GGUF model");
+        return -2;
+    }
+
+    const int32_t trained_ctx = llama_model_n_ctx_train(model);
+    const int32_t resolved_ctx = std::max(512, std::min(static_cast<int32_t>(nCtx), trained_ctx > 0 ? trained_ctx : nCtx));
+    const int32_t resolved_threads = std::max(1, static_cast<int32_t>(nThreads));
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = static_cast<uint32_t>(resolved_ctx);
+    cparams.n_batch = kDefaultBatchSize;
+    cparams.n_ubatch = kDefaultBatchSize;
+    cparams.n_threads = resolved_threads;
+    cparams.n_threads_batch = resolved_threads;
+
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        LOGE("llama_init_from_model failed");
+        llama_model_free(model);
+        return -3;
+    }
+
+    common_params_sampling sparams;
+    sparams.temp = temperature;
+    sparams.top_p = topP;
+    sparams.top_k = topK;
+    common_sampler * sampler = common_sampler_init(model, sparams);
+    if (!sampler) {
+        LOGE("common_sampler_init failed");
+        llama_free(ctx);
+        llama_model_free(model);
+        return -4;
+    }
+
+    mtmd_context * mtmd_ctx = nullptr;
+    if (jMmprojPath != nullptr) {
+        const char * mmproj_path = env->GetStringUTFChars(jMmprojPath, nullptr);
+        if (mmproj_path && std::strlen(mmproj_path) > 0) {
+            mtmd_context_params mtmd_params = mtmd_context_params_default();
+            mtmd_params.use_gpu = (nGpuLayers > 0);
+            mtmd_params.n_threads = resolved_threads;
+            mtmd_params.print_timings = false;
+            mtmd_params.warmup = false;
+            const auto mem_usage = mtmd_get_memory_usage(mmproj_path, mtmd_params);
+            const int32_t n_ubatch = static_cast<int32_t>(llama_n_ubatch(ctx));
+            if (mem_usage.use_non_causal && mem_usage.image_max_tokens > n_ubatch) {
+                LOGW("Capping image_max_tokens (%d -> %d) to match n_ubatch for non-causal vision.",
+                     mem_usage.image_max_tokens, n_ubatch);
+                mtmd_params.image_max_tokens = n_ubatch;
+                if (mtmd_params.image_min_tokens > n_ubatch) {
+                    mtmd_params.image_min_tokens = n_ubatch;
+                }
+            }
+            LOGI("Loading mmproj vision projector: %s", mmproj_path);
+            mtmd_ctx = mtmd_init_from_file(mmproj_path, model, mtmd_params);
+            if (!mtmd_ctx) {
+                LOGW("Failed to load mmproj file %s; continuing in text-only mode", mmproj_path);
+            }
+        }
+        if (mmproj_path) env->ReleaseStringUTFChars(jMmprojPath, mmproj_path);
+    }
+
+    g_session.model = model;
+    g_session.ctx = ctx;
+    g_session.sampler = sampler;
+    g_session.chat_templates = common_chat_templates_init(model, "");
+    g_session.mtmd_ctx = mtmd_ctx;
+    g_session.n_ctx = resolved_ctx;
+    g_session.n_threads = resolved_threads;
+    g_session.n_gpu_layers = std::max<int32_t>(0, nGpuLayers);
+    g_session.current_pos = 0;
+    g_session.system_prompt_pos = 0;
+    g_session.system_prompt_applied = false;
+    g_session.active_backend_label = detect_active_backend(g_session.n_gpu_layers);
+
+    LOGI("GGUF model ready. ctx=%d threads=%d vision=%s backend=%s",
+         resolved_ctx, resolved_threads, mtmd_ctx ? "enabled" : "none",
+         g_session.active_backend_label.c_str());
+    return 0;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeGenerateStream(
+        JNIEnv * env,
+        jobject /*thiz*/,
+        jstring jSystemPrompt,
+        jstring jUserPrompt,
+        jbyteArray jRgbBytes,
+        jint imgWidth,
+        jint imgHeight,
+        jint maxTokens,
+        jboolean jEnableThinking,
+        jint thinkingBudgetTokens,
+        jobject jCallback) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    g_cancel_requested.store(false);
+    clear_last_error();
+
+    if (!g_session.model || !g_session.ctx || !g_session.sampler) {
+        return -1;
+    }
+
+    const bool enable_thinking = (jEnableThinking == JNI_TRUE);
+
+    jclass cb_cls = env->GetObjectClass(jCallback);
+    jmethodID mid_prefill = env->GetMethodID(cb_cls, "onPrefillComplete", "(IJZ)V");
+    jmethodID mid_token = env->GetMethodID(cb_cls, "onToken", "(Ljava/lang/String;)V");
+    jmethodID mid_done = env->GetMethodID(cb_cls, "onCompleted", "(IJ)V");
+    jmethodID mid_error = env->GetMethodID(cb_cls, "onError", "(Ljava/lang/String;)V");
+
+    const auto emit_error = [&](const char * msg) {
+        std::string full_msg = msg ? msg : "Native inference error";
+        const std::string detail = get_last_error();
+        if (!detail.empty() && full_msg.find(detail) == std::string::npos) {
+            full_msg += ": " + detail;
+        }
+        jstring jmsg = env->NewStringUTF(full_msg.c_str());
+        env->CallVoidMethod(jCallback, mid_error, jmsg);
+        env->DeleteLocalRef(jmsg);
+    };
+
+    const auto rollback_failed_turn_locked = [&]() {
+        if (!g_session.ctx) return;
+        llama_memory_t mem = llama_get_memory(g_session.ctx);
+        if (llama_memory_seq_rm(mem, 0, g_session.prev_turn_pos, -1)) {
+            g_session.current_pos = g_session.prev_turn_pos;
+            if (g_session.chat_history.size() > g_session.prev_history_size) {
+                g_session.chat_history.resize(g_session.prev_history_size);
+            }
+            if (g_session.sampler) {
+                common_sampler_reset(g_session.sampler);
+            }
+            g_session.can_rollback = false;
+            LOGI("Recovered failed turn cleanly back to KV pos=%d", g_session.current_pos);
+        } else {
+            LOGW("Failed-turn partial rollback rejected (hybrid/recurrent cache); resetting context cleanly.");
+            reset_session_memory_locked();
+        }
+    };
+
+    const auto t_prefill_start = std::chrono::steady_clock::now();
+    int32_t prefill_tokens_count = 0;
+    bool starts_in_thinking = false;
+    std::string active_open_tag = "<think>";
+    std::string active_close_tag = "</think>";
+
+    // Capture system prompt to seed alongside the first user turn (required by Jinja
+    // templates such as Qwen3.5 that reject a standalone system-only message array).
+    std::string system_text;
+    if (jSystemPrompt != nullptr) {
+        const char * sys_cstr = env->GetStringUTFChars(jSystemPrompt, nullptr);
+        if (sys_cstr) {
+            system_text = sys_cstr;
+            env->ReleaseStringUTFChars(jSystemPrompt, sys_cstr);
+        }
+    }
+
+    g_session.prev_turn_pos = g_session.current_pos;
+    g_session.prev_history_size = g_session.chat_history.size();
+    g_session.can_rollback = true;
+
+    const char * user_cstr = env->GetStringUTFChars(jUserPrompt, nullptr);
+    std::string user_text = user_cstr ? std::string(user_cstr) : "";
+    if (user_cstr) env->ReleaseStringUTFChars(jUserPrompt, user_cstr);
+
+    const bool has_image = (jRgbBytes != nullptr && imgWidth > 0 && imgHeight > 0);
+    if (has_image && g_session.mtmd_ctx != nullptr && mtmd_support_vision(g_session.mtmd_ctx)) {
+        // Multimodal path: inject <__media__> marker and evaluate via mtmd
+        const std::string marker = mtmd_default_marker();
+        const std::string prompt_with_marker = marker + "\n" + user_text;
+        const std::string formatted_user = format_turn_locked(
+                "user",
+                prompt_with_marker,
+                system_text,
+                enable_thinking,
+                &starts_in_thinking,
+                &active_open_tag,
+                &active_close_tag);
+
+        const jsize byte_len = env->GetArrayLength(jRgbBytes);
+        const jsize expected_len = imgWidth * imgHeight * 3;
+        if (byte_len < expected_len) {
+            rollback_failed_turn_locked();
+            emit_error("Invalid RGB image buffer size");
+            return -3;
+        }
+
+        std::vector<unsigned char> rgb_buf(static_cast<size_t>(expected_len));
+        env->GetByteArrayRegion(
+                jRgbBytes, 0, expected_len, reinterpret_cast<jbyte *>(rgb_buf.data()));
+
+        mtmd_bitmap * bitmap = mtmd_bitmap_init(
+                static_cast<uint32_t>(imgWidth),
+                static_cast<uint32_t>(imgHeight),
+                rgb_buf.data());
+        if (!bitmap) {
+            rollback_failed_turn_locked();
+            emit_error("Failed to initialize mtmd bitmap");
+            return -4;
+        }
+
+        mtmd_input_text input_text{};
+        input_text.text = formatted_user.c_str();
+        input_text.text_len = formatted_user.size();
+        input_text.add_special = (g_session.current_pos == 0);
+        input_text.parse_special = true;
+
+        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+        const mtmd_bitmap * bitmaps_arr[1] = { bitmap };
+        const int32_t tok_rc = mtmd_tokenize(g_session.mtmd_ctx, chunks, &input_text, bitmaps_arr, 1);
+        mtmd_bitmap_free(bitmap);
+
+        if (tok_rc != 0) {
+            mtmd_input_chunks_free(chunks);
+            rollback_failed_turn_locked();
+            emit_error("mtmd_tokenize failed for multimodal prompt");
+            return -5;
+        }
+
+        const size_t chunk_tokens = mtmd_helper_get_n_tokens(chunks);
+        prefill_tokens_count += static_cast<int32_t>(chunk_tokens);
+        if (g_session.current_pos + static_cast<llama_pos>(chunk_tokens) >=
+            g_session.n_ctx - kOverflowHeadroom) {
+            shift_context_locked();
+        }
+
+        llama_pos new_n_past = g_session.current_pos;
+        const int32_t eval_rc = mtmd_helper_eval_chunks(
+                g_session.mtmd_ctx,
+                g_session.ctx,
+                chunks,
+                g_session.current_pos,
+                0,
+                kDefaultBatchSize,
+                /* logits_last */ true,
+                &new_n_past);
+        mtmd_input_chunks_free(chunks);
+
+        if (eval_rc != 0) {
+            rollback_failed_turn_locked();
+            emit_error("mtmd_helper_eval_chunks failed");
+            return -6;
+        }
+        g_session.current_pos = new_n_past;
+    } else {
+        if (has_image && g_session.mtmd_ctx == nullptr) {
+            LOGW("Image attached, but no mmproj vision projector is loaded; running text prompt only.");
+        }
+        const std::string formatted_user = format_turn_locked(
+                "user",
+                user_text,
+                system_text,
+                enable_thinking,
+                &starts_in_thinking,
+                &active_open_tag,
+                &active_close_tag);
+        const bool has_tpl = common_chat_templates_was_explicit(g_session.chat_templates.get());
+        auto user_tokens = common_tokenize(g_session.ctx, formatted_user, has_tpl && g_session.current_pos == 0, has_tpl);
+        prefill_tokens_count += static_cast<int32_t>(user_tokens.size());
+        if (decode_tokens_in_batches_locked(user_tokens, true) != 0) {
+            rollback_failed_turn_locked();
+            emit_error("Failed to evaluate user prompt tokens");
+            return -7;
+        }
+    }
+
+    const auto t_prefill_end = std::chrono::steady_clock::now();
+    const auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t_prefill_end - t_prefill_start).count();
+    env->CallVoidMethod(
+            jCallback,
+            mid_prefill,
+            static_cast<jint>(prefill_tokens_count),
+            static_cast<jlong>(prefill_ms),
+            static_cast<jboolean>(starts_in_thinking ? JNI_TRUE : JNI_FALSE));
+
+    // Autoregressive decode loop
+    const auto t_decode_start = std::chrono::steady_clock::now();
+    int32_t decode_tokens = 0;
+    const int32_t effective_max_tokens = enable_thinking
+            ? std::min<int32_t>(g_session.n_ctx, std::max<int32_t>(1, maxTokens) + std::max<int32_t>(0, thinkingBudgetTokens))
+            : std::max<int32_t>(1, maxTokens);
+    std::string pending_utf8;
+    std::ostringstream full_assistant;
+    common_batch decode_batch(g_session.ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(g_session.model);
+
+    bool in_thinking_block = starts_in_thinking;
+    bool forced_thinking_close = false;
+    int32_t thought_tokens_seen = 0;
+    std::string tag_window;
+
+    const auto update_thinking_window = [&](const std::string & added) {
+        tag_window += added;
+        if (tag_window.size() > 64) {
+            tag_window.erase(0, tag_window.size() - 64);
+        }
+        static const char * kOpenTags[] = {"<think>", "<thought>", "<|thought|>", "<reasoning>", "<|channel>thought"};
+        static const char * kCloseTags[] = {"</think>", "</thought>", "<|end_thought|>", "</reasoning>", "<channel|>"};
+        size_t last_open = std::string::npos;
+        for (const char * tag : kOpenTags) {
+            size_t pos = tag_window.rfind(tag);
+            if (pos != std::string::npos && (last_open == std::string::npos || pos > last_open)) {
+                last_open = pos;
+                active_open_tag = tag;
+            }
+        }
+        size_t last_close = std::string::npos;
+        for (const char * tag : kCloseTags) {
+            size_t pos = tag_window.rfind(tag);
+            if (pos != std::string::npos && (last_close == std::string::npos || pos > last_close)) {
+                last_close = pos;
+                active_close_tag = tag;
+            }
+        }
+        if (last_close != std::string::npos && (last_open == std::string::npos || last_close > last_open)) {
+            in_thinking_block = false;
+        } else if (last_open != std::string::npos) {
+            in_thinking_block = true;
+        }
+    };
+
+    for (int32_t step = 0; step < effective_max_tokens; ++step) {
+        if (g_cancel_requested.load()) {
+            LOGI("Generation cancelled by caller after %d tokens", decode_tokens);
+            break;
+        }
+        if (g_session.current_pos >= g_session.n_ctx - kOverflowHeadroom) {
+            shift_context_locked();
+        }
+
+        if (enable_thinking &&
+            in_thinking_block &&
+            !forced_thinking_close &&
+            thinkingBudgetTokens > 0 &&
+            thought_tokens_seen >= thinkingBudgetTokens) {
+            const std::string close_seq = (active_close_tag == "<channel|>")
+                    ? "<channel|>"
+                    : ("\n" + active_close_tag + "\n\n");
+            auto close_tokens = common_tokenize(g_session.ctx, close_seq, false, true);
+            if (!close_tokens.empty() && decode_tokens_in_batches_locked(close_tokens, true) == 0) {
+                for (const llama_token ctok : close_tokens) {
+                    common_sampler_accept(g_session.sampler, ctok, false);
+                }
+                full_assistant << close_seq;
+                jstring jclose = env->NewStringUTF(close_seq.c_str());
+                env->CallVoidMethod(jCallback, mid_token, jclose);
+                env->DeleteLocalRef(jclose);
+                in_thinking_block = false;
+                forced_thinking_close = true;
+                tag_window.clear();
+                LOGI("Thinking budget (%d tok) reached; closing reasoning block cleanly.", thinkingBudgetTokens);
+            }
+        }
+
+        const llama_token next_tok = common_sampler_sample(g_session.sampler, g_session.ctx, -1);
+        common_sampler_accept(g_session.sampler, next_tok, true);
+
+        if (llama_vocab_is_eog(vocab, next_tok)) {
+            break;
+        }
+
+        if (in_thinking_block) {
+            thought_tokens_seen++;
+        }
+
+        const std::string piece = common_token_to_piece(g_session.ctx, next_tok);
+        pending_utf8 += piece;
+        if (is_valid_utf8(pending_utf8.c_str())) {
+            full_assistant << pending_utf8;
+            update_thinking_window(pending_utf8);
+            jstring jtok = env->NewStringUTF(pending_utf8.c_str());
+            env->CallVoidMethod(jCallback, mid_token, jtok);
+            env->DeleteLocalRef(jtok);
+            pending_utf8.clear();
+        }
+
+        decode_batch.clear();
+        decode_batch.add(next_tok, g_session.current_pos, 0, true);
+        if (llama_process(g_session.ctx, LLAMA_PROCESS_TYPE_DECODE, decode_batch.get()) != 0) {
+            rollback_failed_turn_locked();
+            emit_error("llama_process failed during token decode");
+            return -8;
+        }
+        g_session.current_pos++;
+        decode_tokens++;
+    }
+
+    std::string assistant_history_text = full_assistant.str();
+    if (starts_in_thinking &&
+        !active_open_tag.empty() &&
+        assistant_history_text.rfind(active_open_tag, 0) != 0) {
+        assistant_history_text = active_open_tag + "\n" + assistant_history_text;
+    }
+    format_turn_locked("assistant", assistant_history_text, "", enable_thinking);
+
+    const auto t_decode_end = std::chrono::steady_clock::now();
+    const auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t_decode_end - t_decode_start).count();
+    env->CallVoidMethod(jCallback, mid_done, static_cast<jint>(decode_tokens), static_cast<jlong>(decode_ms));
+    return 0;
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeCancelGeneration(
+        JNIEnv * /*env*/,
+        jobject /*thiz*/) {
+    g_cancel_requested.store(true);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeRollbackLastTurn(
+        JNIEnv * /*env*/,
+        jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    if (!g_session.ctx || !g_session.can_rollback) {
+        return JNI_FALSE;
+    }
+    llama_memory_t mem = llama_get_memory(g_session.ctx);
+    if (!llama_memory_seq_rm(mem, 0, g_session.prev_turn_pos, -1)) {
+        LOGW("Partial KV rollback unsupported at pos=%d (hybrid/recurrent model); caller should reset.",
+             g_session.prev_turn_pos);
+        return JNI_FALSE;
+    }
+    g_session.current_pos = g_session.prev_turn_pos;
+    if (g_session.chat_history.size() > g_session.prev_history_size) {
+        g_session.chat_history.resize(g_session.prev_history_size);
+    }
+    if (g_session.sampler) {
+        common_sampler_reset(g_session.sampler);
+    }
+    g_session.can_rollback = false;
+    LOGI("Rolled back last conversation turn to KV pos=%d", g_session.current_pos);
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeResetContext(
+        JNIEnv * /*env*/,
+        jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    reset_session_memory_locked();
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeUnloadModel(
+        JNIEnv * /*env*/,
+        jobject /*thiz*/) {
+    g_cancel_requested.store(true);
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    free_session_locked();
+    LOGI("GGUF model unloaded and native buffers released");
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeGetStatsJson(
+        JNIEnv * env,
+        jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    uint64_t model_bytes = 0;
+    if (g_session.model) {
+        model_bytes = llama_model_size(g_session.model);
+    }
+    std::ostringstream oss;
+    oss << "{"
+        << "\"loaded\":" << (g_session.model != nullptr ? "true" : "false") << ","
+        << "\"kvUsed\":" << g_session.current_pos << ","
+        << "\"kvMax\":" << g_session.n_ctx << ","
+        << "\"modelBytes\":" << model_bytes << ","
+        << "\"visionEnabled\":" << (g_session.mtmd_ctx != nullptr ? "true" : "false") << ","
+        << "\"backend\":\"" << g_session.active_backend_label << "\""
+        << "}";
+    return env->NewStringUTF(oss.str().c_str());
+}
+
+} // extern "C"
