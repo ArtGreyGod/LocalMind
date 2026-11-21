@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -86,7 +88,16 @@ fun TelemetryAndTuningSheet(
     onTrimOlderContextTurns: () -> Unit = {},
     slashCommands: List<SlashCommandItem> = emptyList(),
     onAddCustomTemplate: (trigger: String, label: String, promptBody: String) -> Unit = { _, _, _ -> },
-    onDeleteCustomTemplate: (id: String) -> Unit = {}
+    onDeleteCustomTemplate: (id: String) -> Unit = {},
+    semanticRetrievalEnabled: Boolean = false,
+    embeddingModelId: String? = null,
+    embeddingCandidates: List<com.example.domain.engine.LocalModelEntry> = emptyList(),
+    onSetSemanticRetrieval: (Boolean) -> Unit = {},
+    onSetEmbeddingModel: (String?) -> Unit = {},
+    appLockEnabled: Boolean = false,
+    onSetAppLock: (Boolean) -> Unit = {},
+    nativeDiagnostics: String? = null,
+    onRefreshDiagnostics: () -> Unit = {}
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val semantic = LocalSemanticColors.current
@@ -116,6 +127,7 @@ fun TelemetryAndTuningSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
+                .imePadding()
         ) {
             // Cursor-inspired Customize Top Header (X | Customize | Done)
             Row(
@@ -362,11 +374,12 @@ fun TelemetryAndTuningSheet(
                             Slider(
                                 value = tuning.thinkingBudgetTokens.toFloat(),
                                 onValueChange = { v ->
+                                    // Snap to the 256-tok grid; no `steps` ticks, so every
+                                    // multiple of 256 (incl. 2048) stays reachable.
                                     val snapped = ((v / 256f).roundToInt() * 256).coerceIn(256, 4096)
                                     onUpdateTuning { it.copy(thinkingBudgetTokens = snapped) }
                                 },
                                 valueRange = 256f..4096f,
-                                steps = 14,
                                 colors = cursorSliderColors,
                                 modifier = Modifier.testTag("thinking_budget_slider")
                             )
@@ -481,6 +494,19 @@ fun TelemetryAndTuningSheet(
                     onDeleteTemplate = onDeleteCustomTemplate
                 )
 
+                // Privacy, Retrieval & Diagnostics Section
+                PrivacyRetrievalSection(
+                    semanticRetrievalEnabled = semanticRetrievalEnabled,
+                    embeddingModelId = embeddingModelId,
+                    embeddingCandidates = embeddingCandidates,
+                    onSetSemanticRetrieval = onSetSemanticRetrieval,
+                    onSetEmbeddingModel = onSetEmbeddingModel,
+                    appLockEnabled = appLockEnabled,
+                    onSetAppLock = onSetAppLock,
+                    nativeDiagnostics = nativeDiagnostics,
+                    onRefreshDiagnostics = onRefreshDiagnostics
+                )
+
                 // Hardware & Sampling Section
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Row(
@@ -565,7 +591,7 @@ fun TelemetryAndTuningSheet(
                             value = tuning.threads.toFloat(),
                             onValueChange = { v -> onUpdateTuning { it.copy(threads = v.roundToInt()) } },
                             valueRange = 1f..8f,
-                            steps = 6,
+                            // No `steps`: evenly-spaced ticks would make values like 4 unreachable
                             colors = cursorSliderColors,
                             modifier = Modifier.testTag("threads_slider")
                         )
@@ -580,7 +606,7 @@ fun TelemetryAndTuningSheet(
                             value = tuning.gpuLayers.toFloat(),
                             onValueChange = { v -> onUpdateTuning { it.copy(gpuLayers = v.roundToInt()) } },
                             valueRange = 0f..40f,
-                            steps = 7,
+                            // No `steps`: keeps 10/20/30 and all other integer values reachable
                             colors = cursorSliderColors,
                             modifier = Modifier.testTag("gpu_layers_slider")
                         )
@@ -912,6 +938,128 @@ private fun SlashTemplatesCustomizeSection(
                 }
             }
             Hairline()
+        }
+    }
+}
+
+@Composable
+private fun PrivacyRetrievalSection(
+    semanticRetrievalEnabled: Boolean,
+    embeddingModelId: String?,
+    embeddingCandidates: List<com.example.domain.engine.LocalModelEntry>,
+    onSetSemanticRetrieval: (Boolean) -> Unit,
+    onSetEmbeddingModel: (String?) -> Unit,
+    appLockEnabled: Boolean,
+    onSetAppLock: (Boolean) -> Unit,
+    nativeDiagnostics: String?,
+    onRefreshDiagnostics: () -> Unit
+) {
+    val switchColors = SwitchDefaults.colors(
+        checkedThumbColor = Color.White,
+        checkedTrackColor = MaterialTheme.colorScheme.secondary,
+        uncheckedThumbColor = Color.White,
+        uncheckedTrackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+        uncheckedBorderColor = Color.Transparent
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SectionCaption(text = "Privacy & Retrieval")
+        Surface(
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp)) {
+                CustomizeSwitchRow(
+                    icon = LocalMindIcons.Visibility,
+                    title = "Biometric App Lock",
+                    subtitle = "Require device unlock to open LocalMind",
+                    checked = appLockEnabled,
+                    onCheckedChange = onSetAppLock,
+                    switchColors = switchColors,
+                    switchTag = "app_lock_switch"
+                )
+                Hairline()
+                CustomizeSwitchRow(
+                    icon = LocalMindIcons.Psychology,
+                    title = "Semantic Retrieval",
+                    subtitle = "Rerank document search results with an embedding model",
+                    checked = semanticRetrievalEnabled,
+                    onCheckedChange = onSetSemanticRetrieval,
+                    switchColors = switchColors,
+                    switchTag = "semantic_retrieval_switch"
+                )
+                AnimatedVisibility(visible = semanticRetrievalEnabled) {
+                    Column(
+                        modifier = Modifier.padding(bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Embedding model (BERT-family GGUF):",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (embeddingCandidates.isEmpty()) {
+                            Text(
+                                text = "No candidates found. Import a small embedding GGUF via the Model Vault first.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            WrapFlowRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalSpacing = 8.dp,
+                                verticalSpacing = 8.dp
+                            ) {
+                                embeddingCandidates.forEach { candidate ->
+                                    SelectablePill(
+                                        label = candidate.displayName,
+                                        selected = embeddingModelId == candidate.id,
+                                        onClick = { onSetEmbeddingModel(candidate.id) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        SectionCaption(text = "Diagnostics")
+        Surface(
+            color = MaterialTheme.colorScheme.surface,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Recent native engine warnings/errors",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    SelectablePill(
+                        label = "Refresh",
+                        selected = false,
+                        onClick = onRefreshDiagnostics
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = nativeDiagnostics ?: "Tap refresh to pull the last 200 native log lines.",
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontFamily = com.example.ui.theme.JetBrainsMonoFontFamily
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 180.dp)
+                        .verticalScroll(rememberScrollState())
+                )
+            }
         }
     }
 }

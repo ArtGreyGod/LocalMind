@@ -1,9 +1,11 @@
 package com.example
 
+import android.content.Intent
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.core.tween
@@ -13,16 +15,22 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationRail
@@ -30,8 +38,10 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.VerticalDivider
@@ -42,12 +52,16 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination
@@ -68,6 +82,7 @@ import com.example.ui.theme.LocalSemanticColors
 import com.example.ui.theme.MotionTokens
 import com.example.ui.theme.rememberPrefersReducedMotion
 import com.example.ui.viewmodel.LocalMindViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.serialization.Serializable
 import kotlin.math.roundToInt
 
@@ -87,21 +102,170 @@ private fun NavDestination?.spatialOrder(): Int = when {
     else -> 0
 }
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
+    private var isUnlocked by mutableStateOf(false)
+    private val pendingSharedText = MutableStateFlow<String?>(null)
+    private val pendingNewChat = MutableStateFlow(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        consumeLaunchIntent(intent)
         setContent {
             val viewModel: LocalMindViewModel = viewModel()
             val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+            val appLockEnabled by viewModel.appLockEnabled.collectAsStateWithLifecycle()
             val useDarkTheme = when (uiState.themeMode) {
                 AppThemeMode.SYSTEM -> isSystemInDarkTheme()
                 AppThemeMode.DARK -> true
                 AppThemeMode.LIGHT -> false
             }
             LocalMindTheme(darkTheme = useDarkTheme) {
-                LocalMindRootScreen(viewModel = viewModel)
+                if (appLockEnabled && !isUnlocked) {
+                    LockScreen(onUnlocked = { isUnlocked = true })
+                } else {
+                    LocalMindRootScreen(viewModel = viewModel)
+                }
             }
+            // Consume launch intents (share-sheet text, new-chat shortcut) once composition is live.
+            LaunchedEffect(Unit) {
+                pendingSharedText.collect { text ->
+                    if (!text.isNullOrBlank()) {
+                        viewModel.handleSharedText(text)
+                        pendingSharedText.value = null
+                    }
+                }
+            }
+            LaunchedEffect(Unit) {
+                pendingNewChat.collect { requested ->
+                    if (requested) {
+                        viewModel.createNewThread()
+                        pendingNewChat.value = false
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeLaunchIntent(intent)
+    }
+
+    private fun consumeLaunchIntent(intent: Intent?) {
+        if (intent == null) return
+        when (intent.action) {
+            ACTION_NEW_CHAT -> pendingNewChat.value = true
+            Intent.ACTION_SEND -> {
+                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                if (!text.isNullOrBlank()) {
+                    pendingSharedText.value = text
+                }
+            }
+        }
+    }
+
+    fun authenticate(onSuccess: () -> Unit, onError: (String) -> Unit) {
+        val bm = BiometricManager.from(this)
+        val canAuth = bm.canAuthenticate(
+            BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        )
+        if (canAuth != BiometricManager.BIOMETRIC_SUCCESS) {
+            onError("No screen lock or biometrics enrolled on this device")
+            return
+        }
+        val prompt = BiometricPrompt(
+            this,
+            ContextCompat.getMainExecutor(this),
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    onSuccess()
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    onError(errString.toString())
+                }
+            }
+        )
+        prompt.authenticate(
+            BiometricPrompt.PromptInfo.Builder()
+                .setTitle(getString(R.string.lock_screen_title))
+                .setSubtitle(getString(R.string.lock_screen_subtitle))
+                .setAllowedAuthenticators(
+                    BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                        BiometricManager.Authenticators.DEVICE_CREDENTIAL
+                )
+                .build()
+        )
+    }
+
+    companion object {
+        const val ACTION_NEW_CHAT = "com.example.localmind.action.NEW_CHAT"
+    }
+}
+
+@Composable
+private fun LockScreen(
+    onUnlocked: () -> Unit,
+    onAuthError: (String) -> Unit = {}
+) {
+    // The parent activity performs the actual BiometricPrompt flow via [MainActivity].
+    // Reaching here means appLock is enabled; prompt immediately on first composition.
+    val activity = androidx.compose.ui.platform.LocalContext.current as? MainActivity
+    var lastError by rememberSaveable { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        activity?.authenticate(
+            onSuccess = onUnlocked,
+            onError = { onAuthError(it); lastError = it }
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            imageVector = LocalMindIcons.ChatBubble,
+            contentDescription = null,
+            modifier = Modifier.size(56.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = stringResource(R.string.lock_screen_title),
+            style = MaterialTheme.typography.headlineSmall,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = stringResource(R.string.lock_screen_subtitle),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        lastError?.let { err ->
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = err,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.error,
+                textAlign = TextAlign.Center
+            )
+        }
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = {
+            activity?.authenticate(
+                onSuccess = onUnlocked,
+                onError = { onAuthError(it); lastError = it }
+            )
+        }) {
+            Text(stringResource(R.string.btn_unlock))
         }
     }
 }
@@ -142,7 +306,18 @@ fun LocalMindRootScreen(
     LaunchedEffect(uiState.statusBanner) {
         val message = uiState.statusBanner
         if (!message.isNullOrBlank()) {
-            snackbarHostState.showSnackbar(message)
+            if (message == "Thread deleted" && viewModel.hasUndoableThreadDelete()) {
+                val result = snackbarHostState.showSnackbar(
+                    message = message,
+                    actionLabel = "Undo",
+                    duration = SnackbarDuration.Short
+                )
+                if (result == SnackbarResult.ActionPerformed) {
+                    viewModel.undoDeleteThread()
+                }
+            } else {
+                snackbarHostState.showSnackbar(message)
+            }
             viewModel.clearStatusBanner()
         }
     }
@@ -166,7 +341,16 @@ fun LocalMindRootScreen(
             onTrimOlderContextTurns = viewModel::trimOlderContextTurns,
             slashCommands = slashCommands,
             onAddCustomTemplate = viewModel::addCustomTemplate,
-            onDeleteCustomTemplate = viewModel::deleteCustomTemplate
+            onDeleteCustomTemplate = viewModel::deleteCustomTemplate,
+            semanticRetrievalEnabled = viewModel.semanticRetrievalEnabled.collectAsStateWithLifecycle().value,
+            embeddingModelId = viewModel.embeddingModelId.collectAsStateWithLifecycle().value,
+            embeddingCandidates = registeredModels.filter { it.format.label.isNotBlank() },
+            onSetSemanticRetrieval = viewModel::setSemanticRetrieval,
+            onSetEmbeddingModel = viewModel::setEmbeddingModel,
+            appLockEnabled = viewModel.appLockEnabled.collectAsStateWithLifecycle().value,
+            onSetAppLock = viewModel::setAppLock,
+            nativeDiagnostics = uiState.nativeDiagnostics,
+            onRefreshDiagnostics = viewModel::loadNativeDiagnostics
         )
     }
 
@@ -367,6 +551,7 @@ fun LocalMindRootScreen(
                                 onShowStatusBanner = viewModel::showStatusBanner,
                                 onAttachImageUri = viewModel::attachImageUri,
                                 onClearPendingImage = viewModel::clearPendingImage,
+                                onRemovePendingImage = viewModel::removePendingImage,
                                 onToggleThinking = viewModel::toggleThinking,
                                 onOpenModelVault = { navigateToRoute(VaultRoute) },
                                 onOpenTelemetrySheet = { showTelemetrySheet = true },
@@ -386,7 +571,11 @@ fun LocalMindRootScreen(
                                 onOpenThreadsHub = { navigateToRoute(ThreadsRoute) },
                                 onDismissMemoryWarning = viewModel::dismissMemoryPressureWarning,
                                 onTrimContextFromMemoryWarning = viewModel::trimContextFromMemoryWarning,
-                                onUnloadFromMemoryWarning = viewModel::unloadFromMemoryWarning
+                                onUnloadFromMemoryWarning = viewModel::unloadFromMemoryWarning,
+                                onSaveDraft = viewModel::saveDraft,
+                                onRestoreDraft = viewModel::restoreDraft,
+                                pendingSharedText = uiState.pendingSharedText,
+                                onConsumeSharedText = viewModel::clearPendingSharedText
                             )
                         }
 
@@ -406,7 +595,10 @@ fun LocalMindRootScreen(
                                 onCreateWorkspace = viewModel::createWorkspace,
                                 onDeleteWorkspace = viewModel::deleteWorkspace,
                                 onOpenModelVault = { navigateToRoute(VaultRoute) },
-                                onBackToWorkbench = { navigateToRoute(WorkbenchRoute) }
+                                onBackToWorkbench = { navigateToRoute(WorkbenchRoute) },
+                                onExportThread = viewModel::exportThreadJson,
+                                onImportThread = viewModel::importThreadJson,
+                                onSearchMessages = viewModel::searchThreadMessages
                             )
                         }
 
@@ -433,6 +625,7 @@ fun LocalMindRootScreen(
                                 onLoadHubRepoFiles = viewModel::loadHubRepoFiles,
                                 onDownloadHubFile = viewModel::downloadHubFile,
                                 onPauseHubDownload = viewModel::pauseHubDownload,
+                                onResumeHubDownload = viewModel::resumeHubDownload,
                                 onCancelHubDownload = viewModel::cancelHubDownload
                             )
                         }

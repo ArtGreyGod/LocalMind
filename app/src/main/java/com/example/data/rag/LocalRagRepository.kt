@@ -19,6 +19,15 @@ data class RetrievedRagResult(
     val promptContextBlock: String
 )
 
+/**
+ * Pluggable semantic-embedding provider. When available (an embedding GGUF is loaded),
+ * retrieval reranks the BM25 candidates by cosine similarity; otherwise pure BM25 is used.
+ */
+interface RagEmbeddingProvider {
+    val isAvailable: Boolean
+    suspend fun embed(text: String): FloatArray?
+}
+
 class LocalRagRepository(
     private val context: Context,
     database: LocalMindDatabase
@@ -29,6 +38,8 @@ class LocalRagRepository(
         private const val CHUNK_TARGET_CHARS = 1100
         private const val CHUNK_OVERLAP_CHARS = 180
         private const val MAX_FILE_BYTES = 16L * 1024L * 1024L
+        private const val SQLITE_VARIABLE_LIMIT = 500
+        private const val RERANK_CANDIDATES = 24
 
         private val stopWords = setOf(
             "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
@@ -142,19 +153,41 @@ class LocalRagRepository(
                 error("File exceeds 16 MB local indexing limit ($displayName).")
             }
 
+            // Cap the read even when the provider reports no size (size == 0/-1), so an
+            // unbounded document can never be fully materialized into memory.
             val rawBytes = context.contentResolver.openInputStream(uri)?.use { input ->
-                input.readBytes()
+                val out = java.io.ByteArrayOutputStream(MAX_FILE_BYTES.toInt().coerceAtLeast(64 * 1024))
+                val buffer = ByteArray(256 * 1024)
+                var total = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    total += read
+                    if (total > MAX_FILE_BYTES) {
+                        error("File exceeds 16 MB local indexing limit ($displayName).")
+                    }
+                    out.write(buffer, 0, read)
+                }
+                out.toByteArray()
             } ?: error("Cannot read document stream for $displayName")
+            if (rawBytes.isEmpty()) error("Document $displayName is empty.")
 
             val ext = displayName.substringAfterLast('.', "").lowercase()
             val isPdf = ext == "pdf" || mimeType.contains("pdf", ignoreCase = true)
 
             val sections = if (isPdf) {
-                val extracted = PdfTextExtractor.extractPdfSections(rawBytes)
-                if (extracted.isEmpty()) {
-                    error("No selectable text found in $displayName. If it is a scanned PDF, take a photo for Vision analysis.")
+                val extracted = PdfTextExtractor.extractPdf(rawBytes)
+                if (extracted.sections.isEmpty()) {
+                    error(
+                        if (extracted.skippedGarbledStreams > 0) {
+                            "$displayName uses a custom font encoding that can't be read as text. " +
+                                "If it is a scanned PDF, take a photo for Vision analysis."
+                        } else {
+                            "No selectable text found in $displayName. If it is a scanned PDF, take a photo for Vision analysis."
+                        }
+                    )
                 }
-                extracted
+                extracted.sections
             } else {
                 val decoded = String(rawBytes, StandardCharsets.UTF_8).trim()
                 if (decoded.isEmpty()) error("Document $displayName is empty.")
@@ -198,15 +231,25 @@ class LocalRagRepository(
     suspend fun retrieveContextForPrompt(
         query: String,
         attachedDocs: List<IndexedDocumentEntity>,
-        topK: Int = 3
+        topK: Int = 3,
+        embeddingProvider: RagEmbeddingProvider? = null
     ): RetrievedRagResult? = withContext(Dispatchers.IO) {
         if (attachedDocs.isEmpty()) return@withContext null
         val docIds = attachedDocs.map { it.id }
         val docById = attachedDocs.associateBy { it.id }
-        val allChunks = documentDao.getChunksForDocuments(docIds)
+        // SQLite has a per-statement host-variable limit; large document sets must be
+        // queried in batches and merged.
+        val allChunks = docIds.chunked(SQLITE_VARIABLE_LIMIT).flatMap { batch ->
+            documentDao.getChunksForDocuments(batch)
+        }
         if (allChunks.isEmpty()) return@withContext null
 
-        val topChunks = scoreChunksBm25(query, allChunks, topK = topK)
+        val bm25Ranked = scoreChunksBm25(query, allChunks, topK = RERANK_CANDIDATES)
+        val topChunks = if (embeddingProvider?.isAvailable == true && bm25Ranked.isNotEmpty()) {
+            rerankByEmbedding(query, bm25Ranked, topK, embeddingProvider)
+        } else {
+            bm25Ranked.take(topK)
+        }
         if (topChunks.isEmpty()) return@withContext null
 
         val citations = topChunks.map { chunk ->
@@ -232,6 +275,52 @@ class LocalRagRepository(
         }.trim()
 
         RetrievedRagResult(citations = citations, promptContextBlock = block)
+    }
+
+    /**
+     * Semantic rerank: cosine similarity between the query embedding and each BM25
+     * candidate. BM25 keeps recall (rare-term matches), the embedding pass lifts
+     * paraphrased matches that lexical scoring misses.
+     */
+    private suspend fun rerankByEmbedding(
+        query: String,
+        bm25Candidates: List<DocumentChunkEntity>,
+        topK: Int,
+        provider: RagEmbeddingProvider
+    ): List<DocumentChunkEntity> {
+        val queryVec = runCatching { provider.embed(query) }.getOrNull() ?: return bm25Candidates.take(topK)
+        if (queryVec.isEmpty()) return bm25Candidates.take(topK)
+        data class Scored(val chunk: DocumentChunkEntity, val bm25Rank: Int, val cosine: Double)
+        val scored = buildList {
+            bm25Candidates.forEachIndexed { rank, chunk ->
+                val chunkVec = runCatching { provider.embed(chunk.content) }.getOrNull()
+                if (chunkVec != null && chunkVec.size == queryVec.size) {
+                    add(Scored(chunk, rank, cosineSimilarity(queryVec, chunkVec)))
+                } else {
+                    add(Scored(chunk, rank, 0.0))
+                }
+            }
+        }
+        // Blend: lexical rank keeps strong exact matches stable while cosine promotes
+        // paraphrases. rankBias ≈ 1/rank rewards BM25 winners without zeroing the rest.
+        return scored
+            .map { s -> s.chunk to (s.cosine + 0.05 / (s.bm25Rank + 1)) }
+            .sortedByDescending { it.second }
+            .take(topK)
+            .map { it.first }
+    }
+
+    private fun cosineSimilarity(a: FloatArray, b: FloatArray): Double {
+        var dot = 0.0
+        var normA = 0.0
+        var normB = 0.0
+        for (i in a.indices) {
+            dot += a[i].toDouble() * b[i].toDouble()
+            normA += a[i].toDouble() * a[i].toDouble()
+            normB += b[i].toDouble() * b[i].toDouble()
+        }
+        val denom = kotlin.math.sqrt(normA) * kotlin.math.sqrt(normB)
+        return if (denom > 0.0) dot / denom else 0.0
     }
 
     private fun queryDocumentMetadata(uri: Uri): Triple<String, Long, String> {

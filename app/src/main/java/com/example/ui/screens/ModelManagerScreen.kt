@@ -64,6 +64,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -136,9 +137,13 @@ fun ModelManagerScreen(
     onLoadHubRepoFiles: (String) -> Unit = {},
     onDownloadHubFile: (HfModelFile) -> Unit = {},
     onPauseHubDownload: (String) -> Unit = {},
+    onResumeHubDownload: (String) -> Unit = {},
     onCancelHubDownload: (String) -> Unit = {}
 ) {
-    var pendingPairTargetId by remember { mutableStateOf<String?>(null) }
+    // SAF picker targets must survive process death (likely while an LLM holds RAM).
+    var pendingPairTargetId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingDeleteModelId by rememberSaveable { mutableStateOf<String?>(null) }
+    val pendingDeleteModel = models.firstOrNull { it.id == pendingDeleteModelId }
     var searchOpen by rememberSaveable { mutableStateOf(false) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     val reducedMotion = rememberPrefersReducedMotion()
@@ -148,6 +153,16 @@ fun ModelManagerScreen(
     val pagerState = rememberPagerState(initialPage = VaultTab.INSTALLED.ordinal) { VaultTab.entries.size }
     val installedListState = rememberLazyListState()
     val discoverListState = rememberLazyListState()
+
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { }
+
+    LaunchedEffect(Unit) {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            notifPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     val modelPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -165,6 +180,40 @@ fun ModelManagerScreen(
         if (uri != null && targetId != null) {
             onPairMmprojUri(targetId, uri)
         }
+    }
+
+    pendingDeleteModel?.let { model ->
+        AlertDialog(
+            onDismissRequest = { pendingDeleteModelId = null },
+            title = { Text("Delete Model?") },
+            text = {
+                Text(
+                    text = "Remove \"${model.displayName}\" (${model.format.label}) from the vault? " +
+                        "Its file on disk will be permanently deleted.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDeleteModel(model)
+                        pendingDeleteModelId = null
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("confirm_delete_model_button")
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteModelId = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 
     if (pendingPreflightWarning != null) {
@@ -414,7 +463,7 @@ fun ModelManagerScreen(
                                             },
                                             onDeleteClick = {
                                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                onDeleteModel(entry)
+                                                pendingDeleteModelId = entry.id
                                             }
                                         )
 
@@ -485,6 +534,7 @@ fun ModelManagerScreen(
                                     onLoadRepoFiles = onLoadHubRepoFiles,
                                     onDownloadFile = onDownloadHubFile,
                                     onPauseDownload = onPauseHubDownload,
+                                    onResumeDownload = onResumeHubDownload,
                                     onCancelDownload = onCancelHubDownload
                                 )
                             }
@@ -850,13 +900,29 @@ private fun ModelWorkspaceRow(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "${entry.format.label} • ${entry.quantizationLabel} • ${formatBytes(entry.totalFootprintBytes)}" +
-                        if (entry.isVisionCapable) " • VL" else "",
+                    text = buildString {
+                        append("${entry.format.label} • ${entry.quantizationLabel} • ${formatBytes(entry.totalFootprintBytes)}")
+                        if (entry.isVisionCapable) append(" • VL")
+                        entry.parameterCount?.let { p ->
+                            append(" • ")
+                            append(if (p >= 1_000_000_000L) "%.1fB".format(p / 1_000_000_000.0) else "${p / 1_000_000}M")
+                        }
+                        entry.architecture?.let { append(" • $it") }
+                    },
                     style = MaterialTheme.typography.labelSmall.tabular(),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+                if (entry.trainedContextLength != null && entry.trainedContextLength!! < 4096) {
+                    Text(
+                        text = "Trained context: ${entry.trainedContextLength} tok — higher settings will be clamped",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
 
             if (isLoading) {

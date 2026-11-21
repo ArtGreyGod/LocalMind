@@ -1,13 +1,20 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   LocalMind keeps all conversations, thinking traces, RAG-indexed documents,
+   and model-registry state strictly on-device, so nothing is opted in to
+   Auto Backup. Only the (already non-sensitive) theme preference store is
+   excluded explicitly below; every other domain is excluded by the catch-all.
    See https://developer.android.com/guide/topics/data/autobackup
-   for details.
    Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <!-- Model weights and downloads are far too large for Auto Backup quota. -->
+    <exclude domain="file" path="models/" />
+    <exclude domain="file" path="downloads/" />
+    <exclude domain="file" path="engine_states/" />
+    <!-- Chat history, RAG chunks, and the model registry live in Room + DataStore. -->
+    <exclude domain="database" path="localmind_studio.db" />
+    <exclude domain="database" path="localmind_studio.db-wal" />
+    <exclude domain="database" path="localmind_studio.db-shm" />
+    <exclude domain="file" path="datastore/" />
 </full-backup-content>

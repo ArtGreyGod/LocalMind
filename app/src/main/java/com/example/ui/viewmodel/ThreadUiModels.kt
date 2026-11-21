@@ -26,7 +26,7 @@ data class ChatMessageUi(
     val text: String,
     val thinkingText: String = "",
     val isThinking: Boolean = false,
-    val imageUriString: String? = null,
+    val imageUris: List<String> = emptyList(),
     val isStreaming: Boolean = false,
     val isInterrupted: Boolean = false,
     val telemetry: GenerationTelemetry? = null,
@@ -37,7 +37,11 @@ data class ChatMessageUi(
     val siblingIds: List<String> = listOf(id),
     val citations: List<DocumentCitationUi> = emptyList(),
     val isOutsideContextWindow: Boolean = false
-)
+) {
+    /** Primary (first) attached image; kept for single-image call sites. */
+    val imageUriString: String?
+        get() = imageUris.firstOrNull()
+}
 
 @Immutable
 data class InferenceTuningConfig(
@@ -78,6 +82,7 @@ data class LocalMindUiState(
     val activeWorkspaceName: String = "General",
     val messages: List<ChatMessageUi> = emptyList(),
     val pendingImage: PreparedImage? = null,
+    val pendingImages: List<PreparedImage> = emptyList(),
     val isPreparingImage: Boolean = false,
     val isIndexingDocument: Boolean = false,
     val liveDecodeTokensPerSec: Double = 0.0,
@@ -91,5 +96,14 @@ data class LocalMindUiState(
     val memoryStats: MemoryStats? = null,
     val memoryPressureWarning: MemoryPressureWarning? = null,
     val pendingPreflightWarning: PendingPreflightWarning? = null,
-    val statusBanner: String? = null
-)
+    val statusBanner: String? = null,
+    // Rolling conversation memory generated when older turns are trimmed
+    val threadMemorySummary: String? = null,
+    // Recent native engine warnings/errors for the diagnostics viewer
+    val nativeDiagnostics: String? = null,
+    // Text shared into the app before a model was ready; consumed when the composer opens
+    val pendingSharedText: String? = null
+) {
+    val attachedImages: List<PreparedImage>
+        get() = pendingImages.ifEmpty { listOfNotNull(pendingImage) }
+}

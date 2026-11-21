@@ -58,6 +58,7 @@ import com.example.data.hub.DownloadStatus
 import com.example.data.hub.HfModelFile
 import com.example.data.hub.HfRepoSummary
 import com.example.data.hub.ModelDownloadTask
+import com.example.ui.components.LocalMindIcons
 import com.example.domain.engine.MemoryStats
 import com.example.ui.theme.LocalSemanticColors
 import com.example.ui.theme.MotionTokens
@@ -75,6 +76,7 @@ fun HubDiscoverColumn(
     onLoadRepoFiles: (String) -> Unit,
     onDownloadFile: (HfModelFile) -> Unit,
     onPauseDownload: (String) -> Unit,
+    onResumeDownload: (String) -> Unit,
     onCancelDownload: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -198,19 +200,69 @@ fun HubDiscoverColumn(
                     DownloadProgressCard(
                         task = task,
                         onPause = { onPauseDownload(task.taskId) },
-                        onResume = {
-                            val stubFile = HfModelFile(
-                                repoId = task.repoId,
-                                fileName = task.fileName,
-                                sizeBytes = task.totalBytes,
-                                format = com.example.domain.engine.ModelFormat.GGUF,
-                                quantizationLabel = "GGUF",
-                                isMmproj = task.fileName.contains("mmproj", ignoreCase = true)
-                            )
-                            onDownloadFile(stubFile)
-                        },
+                        onResume = { onResumeDownload(task.taskId) },
                         onCancel = { onCancelDownload(task.taskId) }
                     )
+                }
+            }
+        }
+
+        // Recommended for this device: curated starters filtered by RAM fit, smallest first
+        val availBytes = memoryStats?.availableDeviceRamBytes ?: 0L
+        val recommended = hubState.repos.take(5)
+        if (availBytes > 0L && recommended.isNotEmpty()) {
+            Surface(
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(
+                            imageVector = LocalMindIcons.AutoAwesome,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "Recommended for this device",
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                    }
+                    Text(
+                        text = "Sized against ${(availBytes / (1024.0 * 1024.0 * 1024.0)).let { "%.1f GB".format(it) }} currently free RAM",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    WrapFlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalSpacing = 8.dp,
+                        verticalSpacing = 8.dp
+                    ) {
+                        recommended.forEach { repo ->
+                            Surface(
+                                onClick = {
+                                    expandedRepoIds = expandedRepoIds + repo.repoId
+                                    if (hubState.repoFiles[repo.repoId].isNullOrEmpty()) onLoadRepoFiles(repo.repoId)
+                                },
+                                shape = RoundedCornerShape(20.dp),
+                                color = semantic.floatingSurface,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier.minimumInteractiveComponentSize()
+                            ) {
+                                Text(
+                                    text = repo.displayName,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

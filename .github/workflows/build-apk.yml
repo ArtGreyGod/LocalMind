@@ -24,7 +24,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK 36.1, NDK 28.2, and CMake 3.22.1
+      - name: Install Android SDK 36.1, NDK 28.2, and CMake 3.30.3
         run: |
           SDKMANAGER=$(command -v sdkmanager || find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -n 1)
           echo "Using sdkmanager: $SDKMANAGER"
@@ -35,7 +35,15 @@ jobs:
             "platforms;android-36.1" \
             "build-tools;36.0.0" \
             "ndk;28.2.13676358" \
-            "cmake;3.22.1"
+            "cmake;3.30.3"
+
+      # glslc is required on the build host to precompile ggml-vulkan shaders so the
+      # APK ships real Vulkan GPU offloading. CMake degrades to CPU-only without it.
+      - name: Install glslc (Vulkan shader compiler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslc || sudo apt-get install -y shaderc-tools || true
+          command -v glslc && glslc --version || echo "WARNING: glslc unavailable; Vulkan offload will be disabled in this build"
 
       - name: Ensure debug.keystore exists
         run: |
@@ -50,13 +58,8 @@ jobs:
             fi
           fi
 
-      - name: Set up Gradle 9.3.1
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '9.3.1'
-
-      - name: Build Debug APK (Kotlin + C++17 llama.cpp NDK)
-        run: gradle assembleDebug --no-daemon
+      - name: Build Debug APK (Kotlin + C++17 llama.cpp NDK, Vulkan GPU offload)
+        run: ./gradlew assembleDebug --no-daemon
 
       - name: Copy APK with readable name
         run: cp app/build/outputs/apk/debug/app-debug.apk LocalMind-arm64-debug.apk

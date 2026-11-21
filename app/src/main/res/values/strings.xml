@@ -43,4 +43,22 @@
     <string name="btn_jump_to_bottom">Scroll to latest message</string>
     <string name="btn_prev_branch">Previous response branch</string>
     <string name="btn_next_branch">Next response branch</string>
+    <string name="shortcut_new_chat">New chat</string>
+    <string name="download_notification_title">Downloading model</string>
+    <string name="download_notification_preparing">Preparing download…</string>
+    <string name="download_notification_channel">Model downloads</string>
+    <string name="btn_confirm_delete">Delete</string>
+    <string name="btn_cancel_delete">Cancel</string>
+    <string name="confirm_delete_thread">Delete this thread and its full history? This cannot be undone.</string>
+    <string name="confirm_delete_workspace">Delete this workspace? Its threads will move to General.</string>
+    <string name="confirm_delete_model">Delete this model from the vault? Its file on disk will be removed.</string>
+    <string name="btn_undo_delete">Undo</string>
+    <string name="undo_thread_deleted">Thread deleted</string>
+    <string name="lock_screen_title">LocalMind is locked</string>
+    <string name="lock_screen_subtitle">Authenticate to open your local AI workbench</string>
+    <string name="btn_unlock">Unlock</string>
+    <string name="semantic_retrieval_toggle">Semantic retrieval (embedding rerank)</string>
+    <string name="semantic_retrieval_hint">Improves document answers by reranking BM25 results with an embedding model. Requires a small embedding GGUF (BERT-family) from the Vault.</string>
+    <string name="diagnostics_title">Native diagnostics</string>
+    <string name="btn_refresh_diagnostics">Refresh diagnostics</string>
 </resources>

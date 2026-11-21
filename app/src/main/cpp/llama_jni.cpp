@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -64,6 +65,33 @@ std::atomic<uint64_t> g_atomic_model_bytes{0};
 std::string g_atomic_backend_label = "CPU (ARMv8.2 NEON/dotprod)";
 EngineSession g_session;
 
+// Diagnostics ring buffer of recent llama/ggml warnings & errors for the in-app viewer.
+constexpr size_t kMaxRecentLogLines = 200;
+std::deque<std::string> g_recent_logs;
+
+void record_recent_log_locked(const char * text) {
+    std::string line(text);
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+    if (!line.empty()) {
+        g_recent_logs.push_back(std::move(line));
+        while (g_recent_logs.size() > kMaxRecentLogLines) {
+            g_recent_logs.pop_front();
+        }
+    }
+}
+
+// Separate lightweight session for semantic-RAG embedding models (e.g. BERT-family GGUFs).
+struct EmbeddingSession {
+    llama_model * model = nullptr;
+    llama_context * ctx = nullptr;
+    int32_t n_ctx = 512;
+    int32_t n_embd = 0;
+};
+EmbeddingSession g_embed_session;
+std::mutex g_embed_mutex;
+
 void sync_atomic_stats_locked() {
     g_atomic_loaded.store(g_session.model != nullptr, std::memory_order_relaxed);
     g_atomic_vision.store(g_session.mtmd_ctx != nullptr, std::memory_order_relaxed);
@@ -93,11 +121,16 @@ void android_llama_log_callback(ggml_log_level level, const char * text, void * 
             }
             if (!line.empty()) {
                 g_last_error_msg = line;
+                record_recent_log_locked(line.c_str());
             }
             break;
         }
         case GGML_LOG_LEVEL_WARN:
             LOGW("%s", text);
+            {
+                std::lock_guard<std::mutex> lock(g_log_mutex);
+                record_recent_log_locked(text);
+            }
             break;
         default:
             break;
@@ -664,9 +697,9 @@ Java_com_example_data_engine_LlamaCppNativeBridge_nativeGenerateStream(
         jobject /*thiz*/,
         jstring jSystemPrompt,
         jstring jUserPrompt,
-        jbyteArray jRgbBytes,
-        jint imgWidth,
-        jint imgHeight,
+        jobjectArray jRgbPlanes,
+        jintArray jImgWidths,
+        jintArray jImgHeights,
         jint maxTokens,
         jboolean jEnableThinking,
         jint thinkingBudgetTokens,
@@ -742,11 +775,56 @@ Java_com_example_data_engine_LlamaCppNativeBridge_nativeGenerateStream(
     std::string user_text = user_cstr ? std::string(user_cstr) : "";
     if (user_cstr) env->ReleaseStringUTFChars(jUserPrompt, user_cstr);
 
-    const bool has_image = (jRgbBytes != nullptr && imgWidth > 0 && imgHeight > 0);
-    if (has_image && g_session.mtmd_ctx != nullptr && mtmd_support_vision(g_session.mtmd_ctx)) {
-        // Multimodal path: inject <__media__> marker and evaluate via mtmd
+    // Unpack the (possibly multiple) packed-RGB image planes.
+    std::vector<mtmd_bitmap *> owned_bitmaps;
+    const bool has_image = (jRgbPlanes != nullptr && jImgWidths != nullptr && jImgHeights != nullptr);
+    if (has_image) {
+        const jsize nImages = env->GetArrayLength(jRgbPlanes);
+        jint * widths = env->GetIntArrayElements(jImgWidths, nullptr);
+        jint * heights = env->GetIntArrayElements(jImgHeights, nullptr);
+        if (!widths || !heights) {
+            if (widths) env->ReleaseIntArrayElements(jImgWidths, widths, JNI_ABORT);
+            if (heights) env->ReleaseIntArrayElements(jImgHeights, heights, JNI_ABORT);
+            emit_error("Invalid image dimension arrays");
+            return -3;
+        }
+        for (jsize i = 0; i < nImages; ++i) {
+            const jint imgWidth = widths[i];
+            const jint imgHeight = heights[i];
+            if (imgWidth <= 0 || imgHeight <= 0) continue;
+            auto plane = static_cast<jbyteArray>(env->GetObjectArrayElement(jRgbPlanes, i));
+            if (plane == nullptr) continue;
+            const jsize byte_len = env->GetArrayLength(plane);
+            const jsize expected_len = imgWidth * imgHeight * 3;
+            if (byte_len < expected_len) {
+                env->DeleteLocalRef(plane);
+                continue;
+            }
+            auto * rgb_buf = new std::vector<unsigned char>(static_cast<size_t>(expected_len));
+            env->GetByteArrayRegion(plane, 0, expected_len, reinterpret_cast<jbyte *>(rgb_buf->data()));
+            env->DeleteLocalRef(plane);
+            mtmd_bitmap * bitmap = mtmd_bitmap_init(
+                    static_cast<uint32_t>(imgWidth),
+                    static_cast<uint32_t>(imgHeight),
+                    rgb_buf->data());
+            delete rgb_buf;
+            if (bitmap) {
+                owned_bitmaps.push_back(bitmap);
+            }
+        }
+        env->ReleaseIntArrayElements(jImgWidths, widths, JNI_ABORT);
+        env->ReleaseIntArrayElements(jImgHeights, heights, JNI_ABORT);
+    }
+
+    if (!owned_bitmaps.empty() && g_session.mtmd_ctx != nullptr && mtmd_support_vision(g_session.mtmd_ctx)) {
+        // Multimodal path: one <__media__> marker per image, then the user text
         const std::string marker = mtmd_default_marker();
-        const std::string prompt_with_marker = marker + "\n" + user_text;
+        std::string prompt_with_marker;
+        for (size_t i = 0; i < owned_bitmaps.size(); ++i) {
+            prompt_with_marker += marker;
+            prompt_with_marker += "\n";
+        }
+        prompt_with_marker += user_text;
         const std::string formatted_user = format_turn_locked(
                 "user",
                 prompt_with_marker,
@@ -756,28 +834,6 @@ Java_com_example_data_engine_LlamaCppNativeBridge_nativeGenerateStream(
                 &active_open_tag,
                 &active_close_tag);
 
-        const jsize byte_len = env->GetArrayLength(jRgbBytes);
-        const jsize expected_len = imgWidth * imgHeight * 3;
-        if (byte_len < expected_len) {
-            rollback_failed_turn_locked();
-            emit_error("Invalid RGB image buffer size");
-            return -3;
-        }
-
-        std::vector<unsigned char> rgb_buf(static_cast<size_t>(expected_len));
-        env->GetByteArrayRegion(
-                jRgbBytes, 0, expected_len, reinterpret_cast<jbyte *>(rgb_buf.data()));
-
-        mtmd_bitmap * bitmap = mtmd_bitmap_init(
-                static_cast<uint32_t>(imgWidth),
-                static_cast<uint32_t>(imgHeight),
-                rgb_buf.data());
-        if (!bitmap) {
-            rollback_failed_turn_locked();
-            emit_error("Failed to initialize mtmd bitmap");
-            return -4;
-        }
-
         mtmd_input_text input_text{};
         input_text.text = formatted_user.c_str();
         input_text.text_len = formatted_user.size();
@@ -785,9 +841,17 @@ Java_com_example_data_engine_LlamaCppNativeBridge_nativeGenerateStream(
         input_text.parse_special = true;
 
         mtmd_input_chunks * chunks = mtmd_input_chunks_init();
-        const mtmd_bitmap * bitmaps_arr[1] = { bitmap };
-        const int32_t tok_rc = mtmd_tokenize(g_session.mtmd_ctx, chunks, &input_text, bitmaps_arr, 1);
-        mtmd_bitmap_free(bitmap);
+        const int32_t tok_rc = mtmd_tokenize(
+                g_session.mtmd_ctx,
+                chunks,
+                &input_text,
+                owned_bitmaps.data(),
+                static_cast<int32_t>(owned_bitmaps.size()));
+
+        for (mtmd_bitmap * bmp : owned_bitmaps) {
+            mtmd_bitmap_free(bmp);
+        }
+        owned_bitmaps.clear();
 
         if (tok_rc != 0) {
             mtmd_input_chunks_free(chunks);
@@ -828,9 +892,13 @@ Java_com_example_data_engine_LlamaCppNativeBridge_nativeGenerateStream(
         g_session.current_pos = new_n_past;
         g_atomic_kv_used.store(g_session.current_pos, std::memory_order_relaxed);
     } else {
-        if (has_image && g_session.mtmd_ctx == nullptr) {
-            LOGW("Image attached, but no mmproj vision projector is loaded; running text prompt only.");
+        if (has_image && (g_session.mtmd_ctx == nullptr || !mtmd_support_vision(g_session.mtmd_ctx))) {
+            LOGW("Image(s) attached, but no usable mtmd vision projector is loaded; running text prompt only.");
         }
+        for (mtmd_bitmap * bmp : owned_bitmaps) {
+            mtmd_bitmap_free(bmp);
+        }
+        owned_bitmaps.clear();
         try {
             const std::string formatted_user = format_turn_locked(
                     "user",
@@ -1118,6 +1186,188 @@ Java_com_example_data_engine_LlamaCppNativeBridge_nativeGetStatsJson(
         << "\"visionEnabled\":" << (g_atomic_vision.load(std::memory_order_relaxed) ? "true" : "false") << ","
         << "\"backend\":\"" << backend << "\""
         << "}";
+    return new_jstring_from_utf8(env, oss.str());
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeLoadEmbeddingModel(
+        JNIEnv * env,
+        jobject /*thiz*/,
+        jstring jModelPath,
+        jint nCtx,
+        jint nThreads) {
+    std::lock_guard<std::mutex> lock(g_embed_mutex);
+    if (jModelPath == nullptr) {
+        return;
+    }
+    const char * model_path = env->GetStringUTFChars(jModelPath, nullptr);
+    if (!model_path) return;
+
+    // Free the previous embedding model before probing the new one
+    if (g_embed_session.ctx) {
+        llama_free(g_embed_session.ctx);
+        g_embed_session.ctx = nullptr;
+    }
+    if (g_embed_session.model) {
+        llama_model_free(g_embed_session.model);
+        g_embed_session.model = nullptr;
+    }
+
+    llama_model_params mparams = llama_model_default_params();
+    // Embedding models are small; keep them on CPU so the main chat model can use the GPU.
+    mparams.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(model_path, mparams);
+    env->ReleaseStringUTFChars(jModelPath, model_path);
+    if (!model) {
+        LOGE("Failed to load embedding model");
+        return;
+    }
+
+    llama_context_params cparams = llama_context_default_params();
+    cparams.embeddings = true;
+    cparams.n_ctx = static_cast<uint32_t>(std::max(512, static_cast<int32_t>(nCtx)));
+    cparams.n_batch = cparams.n_ctx;
+    cparams.n_ubatch = std::min<uint32_t>(cparams.n_batch, 512);
+    cparams.n_threads = std::max(1, static_cast<int32_t>(nThreads));
+    cparams.n_threads_batch = cparams.n_threads;
+    // Pooling defaults to the value advertised by the model metadata (mean for BERT family).
+
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        LOGE("llama_init_from_model failed for embedding model");
+        llama_model_free(model);
+        return;
+    }
+
+    g_embed_session.model = model;
+    g_embed_session.ctx = ctx;
+    g_embed_session.n_ctx = static_cast<int32_t>(cparams.n_ctx);
+    g_embed_session.n_embd = llama_model_n_embd(model);
+    LOGI("Embedding model ready (n_embd=%d ctx=%d)", g_embed_session.n_embd, g_embed_session.n_ctx);
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeUnloadEmbeddingModel(
+        JNIEnv * /*env*/,
+        jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(g_embed_mutex);
+    if (g_embed_session.ctx) {
+        llama_free(g_embed_session.ctx);
+        g_embed_session.ctx = nullptr;
+    }
+    if (g_embed_session.model) {
+        llama_model_free(g_embed_session.model);
+        g_embed_session.model = nullptr;
+    }
+    g_embed_session.n_embd = 0;
+}
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeEmbedText(
+        JNIEnv * env,
+        jobject /*thiz*/,
+        jstring jText) {
+    std::lock_guard<std::mutex> lock(g_embed_mutex);
+    if (!g_embed_session.model || !g_embed_session.ctx || g_embed_session.n_embd <= 0) {
+        return nullptr;
+    }
+    if (jText == nullptr) return nullptr;
+    const char * text_cstr = env->GetStringUTFChars(jText, nullptr);
+    if (!text_cstr) return nullptr;
+    std::string text(text_cstr);
+    env->ReleaseStringUTFChars(jText, text_cstr);
+    if (text.empty()) return nullptr;
+
+    const llama_vocab * vocab = llama_model_get_vocab(g_embed_session.model);
+    auto tokens = common_tokenize(g_embed_session.ctx, text, /* add_special */ true, /* parse_special */ true);
+    if (tokens.empty()) return nullptr;
+    if (static_cast<int32_t>(tokens.size()) > g_embed_session.n_ctx - 4) {
+        tokens.resize(static_cast<size_t>(g_embed_session.n_ctx - 4));
+    }
+
+    common_batch batch(g_embed_session.ctx);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.add(tokens[i], static_cast<int32_t>(i), 0, false);
+    }
+    if (llama_process(g_embed_session.ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+        LOGE("Embedding decode failed");
+        return nullptr;
+    }
+
+    const float * embd = llama_get_embeddings_seq(g_embed_session.ctx, 0);
+    if (embd == nullptr) {
+        // Fall back to the last-token embedding if pooling is unavailable
+        embd = llama_get_embeddings_ith(g_embed_session.ctx, static_cast<int32_t>(tokens.size()) - 1);
+    }
+    if (embd == nullptr) return nullptr;
+
+    jfloatArray result = env->NewFloatArray(g_embed_session.n_embd);
+    if (result == nullptr) return nullptr;
+    std::vector<float> copy(embd, embd + g_embed_session.n_embd);
+    env->SetFloatArrayRegion(result, 0, g_embed_session.n_embd, copy.data());
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeIsEmbeddingModelLoaded(
+        JNIEnv * /*env*/,
+        jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(g_embed_mutex);
+    return (g_embed_session.model != nullptr && g_embed_session.ctx != nullptr && g_embed_session.n_embd > 0) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeSaveSessionState(
+        JNIEnv * env,
+        jobject /*thiz*/,
+        jstring jPath) {
+    if (jPath == nullptr) return JNI_FALSE;
+    const char * path = env->GetStringUTFChars(jPath, nullptr);
+    if (!path) return JNI_FALSE;
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    jboolean ok = JNI_FALSE;
+    if (g_session.ctx && g_session.current_pos > 0) {
+        const size_t written = llama_state_seq_save_file(g_session.ctx, path, 0, nullptr, 0);
+        ok = (written > 0) ? JNI_TRUE : JNI_FALSE;
+    }
+    env->ReleaseStringUTFChars(jPath, path);
+    return ok;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeLoadSessionState(
+        JNIEnv * env,
+        jobject /*thiz*/,
+        jstring jPath) {
+    if (jPath == nullptr) return JNI_FALSE;
+    const char * path = env->GetStringUTFChars(jPath, nullptr);
+    if (!path) return JNI_FALSE;
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    jboolean ok = JNI_FALSE;
+    if (g_session.ctx) {
+        size_t token_count = 0;
+        const size_t loaded = llama_state_seq_load_file(g_session.ctx, path, 0, nullptr, 0, &token_count);
+        if (loaded > 0 && token_count > 0) {
+            g_session.current_pos = static_cast<llama_pos>(token_count);
+            g_session.can_rollback = false;
+            g_session.system_prompt_applied = true;
+            g_atomic_kv_used.store(g_session.current_pos, std::memory_order_relaxed);
+            ok = JNI_TRUE;
+        }
+    }
+    env->ReleaseStringUTFChars(jPath, path);
+    return ok;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_example_data_engine_LlamaCppNativeBridge_nativeGetRecentLogs(
+        JNIEnv * env,
+        jobject /*thiz*/) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    std::ostringstream oss;
+    for (const auto & line : g_recent_logs) {
+        oss << line << '\n';
+    }
     return new_jstring_from_utf8(env, oss.str());
 }
 

@@ -13,13 +13,26 @@ data class ExtractedPageSection(
  * Pure-Kotlin on-device text & PDF content stream extractor.
  * Supports plain text/code/markdown documents and uncompressed or FlateDecode PDFs
  * without external binary dependencies.
+ *
+ * Limitations: PDFs with custom encodings / Identity-H subset fonts without a BOM
+ * produce glyph-index garbage; such streams are detected and skipped (reported as
+ * [PdfExtractionResult.skippedGarbledStreams]) rather than polluting the search index.
  */
 object PdfTextExtractor {
 
-    fun extractPdfSections(pdfBytes: ByteArray): List<ExtractedPageSection> {
-        if (pdfBytes.isEmpty()) return emptyList()
+    data class PdfExtractionResult(
+        val sections: List<ExtractedPageSection>,
+        val skippedGarbledStreams: Int
+    )
+
+    fun extractPdfSections(pdfBytes: ByteArray): List<ExtractedPageSection> =
+        extractPdf(pdfBytes).sections
+
+    fun extractPdf(pdfBytes: ByteArray): PdfExtractionResult {
+        if (pdfBytes.isEmpty()) return PdfExtractionResult(emptyList(), 0)
         val rawLatin = String(pdfBytes, StandardCharsets.ISO_8859_1)
         val sections = mutableListOf<ExtractedPageSection>()
+        var skippedGarbled = 0
 
         var searchIdx = 0
         var pageNum = 1
@@ -35,10 +48,17 @@ object PdfTextExtractor {
             if (dataStart < rawLatin.length && rawLatin[dataStart] == '\r') dataStart++
             if (dataStart < rawLatin.length && rawLatin[dataStart] == '\n') dataStart++
 
+            // Prefer the authoritative /Length from the stream dictionary. Compressed
+            // payloads can legitimately contain the byte sequence "endstream", so the
+            // textual scan below is only a fallback when /Length is missing or indirect.
+            val directLength = Regex("/Length\\s+(\\d+)").find(dictWindow)?.groupValues?.get(1)?.toLongOrNull()
             val endStreamIdx = rawLatin.indexOf("endstream", dataStart)
             if (endStreamIdx < 0) break
 
-            var dataEnd = endStreamIdx
+            val lengthBasedEnd = directLength?.let { dataStart + it.toInt() }?.takeIf { bounds ->
+                bounds > dataStart && bounds <= pdfBytes.size && bounds <= endStreamIdx + 64
+            }
+            var dataEnd = lengthBasedEnd ?: endStreamIdx
             while (dataEnd > dataStart && (rawLatin[dataEnd - 1] == '\n' || rawLatin[dataEnd - 1] == '\r')) {
                 dataEnd--
             }
@@ -52,11 +72,15 @@ object PdfTextExtractor {
                     if (contentStream.contains("BT") && (contentStream.contains("Tj") || contentStream.contains("TJ"))) {
                         val text = parsePdfTextOperators(contentStream).trim()
                         if (text.isNotBlank()) {
-                            sections += ExtractedPageSection(
-                                sectionLabel = "Stream $pageNum",
-                                text = text
-                            )
-                            pageNum++
+                            if (looksLikeGlyphMojibake(text)) {
+                                skippedGarbled++
+                            } else {
+                                sections += ExtractedPageSection(
+                                    sectionLabel = "Stream $pageNum",
+                                    text = text
+                                )
+                                pageNum++
+                            }
                         }
                     }
                 }
@@ -64,7 +88,22 @@ object PdfTextExtractor {
             searchIdx = endStreamIdx + "endstream".length
         }
 
-        return sections
+        return PdfExtractionResult(sections, skippedGarbled)
+    }
+
+    /**
+     * Heuristic for glyph-ID mojibake: Identity-H subset fonts emit 2-byte glyph IDs that,
+     * decoded as Latin-1, produce unusual runs of control chars and non-word symbols
+     * instead of natural language.
+     */
+    internal fun looksLikeGlyphMojibake(text: String): Boolean {
+        val sample = text.take(4000)
+        val meaningful = sample.count { !it.isWhitespace() }
+        if (meaningful < 24) return false
+        val controlChars = sample.count { it.code < 32 && it !in "\n\r\t" }
+        val letters = sample.count { it.isLetterOrDigit() }
+        val letterRatio = letters.toDouble() / sample.length
+        return controlChars >= 8 || letterRatio < 0.35
     }
 
     private fun inflateQuietly(compressed: ByteArray): ByteArray? {

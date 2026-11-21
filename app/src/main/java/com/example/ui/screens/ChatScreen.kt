@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import androidx.core.content.FileProvider
+import java.io.File
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.view.WindowManager
@@ -161,6 +163,7 @@ fun ChatScreen(
     onShowStatusBanner: (String) -> Unit,
     onAttachImageUri: (Uri) -> Unit,
     onClearPendingImage: () -> Unit,
+    onRemovePendingImage: (String) -> Unit = {},
     onToggleThinking: () -> Unit,
     onOpenModelVault: () -> Unit,
     onOpenTelemetrySheet: () -> Unit,
@@ -181,7 +184,11 @@ fun ChatScreen(
     onOpenThreadsHub: () -> Unit = {},
     onDismissMemoryWarning: () -> Unit = {},
     onTrimContextFromMemoryWarning: () -> Unit = {},
-    onUnloadFromMemoryWarning: () -> Unit = {}
+    onUnloadFromMemoryWarning: () -> Unit = {},
+    onSaveDraft: (String?, String) -> Unit = { _, _ -> },
+    onRestoreDraft: (String?) -> String = { "" },
+    pendingSharedText: String? = null,
+    onConsumeSharedText: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
@@ -190,12 +197,24 @@ fun ChatScreen(
     val reducedMotion = rememberPrefersReducedMotion()
     val semantic = LocalSemanticColors.current
 
-    // Kept as MutableState without reading .value here so typing isolates FloatingComposerDock recomposition
-    val promptInputState = rememberSaveable { mutableStateOf("") }
+    // Composer draft is scoped to the active thread: switching threads swaps the draft
+    // (persisted in the ViewModel session store), and rememberSaveable survives process death.
+    val activeThreadId = uiState.activeThreadId
+    val promptInputState = rememberSaveable(activeThreadId) {
+        mutableStateOf(onRestoreDraft(activeThreadId))
+    }
     var showCameraDialog by rememberSaveable { mutableStateOf(false) }
     var editingPromptText by rememberSaveable { mutableStateOf<String?>(null) }
     var showTrimConfirmDialog by rememberSaveable { mutableStateOf(false) }
     var inspectingCitation by remember { mutableStateOf<DocumentCitationUi?>(null) }
+
+    // Text shared into LocalMind from other apps seeds the composer.
+    LaunchedEffect(pendingSharedText) {
+        if (!pendingSharedText.isNullOrBlank()) {
+            promptInputState.value = pendingSharedText
+            onConsumeSharedText()
+        }
+    }
 
     val listState = rememberLazyListState()
     val isAtBottom by remember {
@@ -236,15 +255,31 @@ fun ChatScreen(
     val exportAction = remember(onBuildMarkdownTranscript, onShowStatusBanner) {
         {
             val md = onBuildMarkdownTranscript()
-            clipboard.setText(AnnotatedString(md))
-            val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "text/markdown"
-                putExtra(Intent.EXTRA_SUBJECT, "LocalMind Chat Transcript")
-                putExtra(Intent.EXTRA_TEXT, md)
+            // Long transcripts overflow the ~1 MB binder buffer if pushed through intent
+            // extras; share via a FileProvider-cached file instead, with a truncated
+            // clipboard copy as a convenience.
+            runCatching {
+                val exportsDir = File(context.cacheDir, "exports").apply { mkdirs() }
+                val outFile = File(exportsDir, "localmind_transcript_${System.currentTimeMillis()}.md")
+                outFile.writeText(md)
+                val shareUri = FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    outFile
+                )
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/markdown"
+                    putExtra(Intent.EXTRA_SUBJECT, "LocalMind Chat Transcript")
+                    putExtra(Intent.EXTRA_STREAM, shareUri)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+                context.startActivity(Intent.createChooser(shareIntent, "Export Markdown Transcript"))
+                runCatching { clipboard.setText(AnnotatedString(md.take(100_000))) }
+                onShowStatusBanner("Markdown transcript exported (large transcripts shared as file)")
+            }.onFailure {
+                onShowStatusBanner("Export failed: ${it.message ?: "unknown error"}")
             }
-            val chooser = Intent.createChooser(sendIntent, "Export Markdown Transcript")
-            runCatching { context.startActivity(chooser) }
-            onShowStatusBanner("Markdown transcript copied & ready to share")
+            Unit
         }
     }
 
@@ -559,7 +594,7 @@ fun ChatScreen(
             isThinkingStream = lastMsg?.isThinking == true,
             isPreparingImage = uiState.isPreparingImage,
             isIndexingDocument = uiState.isIndexingDocument,
-            pendingImage = uiState.pendingImage,
+            pendingImages = uiState.attachedImages,
             enableThinking = uiState.tuning.enableThinking,
             activeModelVisionCapable = activeModel == null || activeModel.isVisionCapable,
             attachedDocuments = attachedDocuments,
@@ -571,6 +606,7 @@ fun ChatScreen(
             onToggleThinking = onToggleThinking,
             onAttachImageUri = onAttachImageUri,
             onClearPendingImage = onClearPendingImage,
+            onRemovePendingImage = onRemovePendingImage,
             onAttachDocumentUri = onAttachDocumentUri,
             onRemoveDocument = onRemoveDocument,
             onExecuteSlashAction = onExecuteSlashAction,
@@ -597,7 +633,7 @@ private fun FloatingComposerDock(
     isThinkingStream: Boolean,
     isPreparingImage: Boolean,
     isIndexingDocument: Boolean,
-    pendingImage: com.example.domain.engine.PreparedImage?,
+    pendingImages: List<com.example.domain.engine.PreparedImage>,
     enableThinking: Boolean,
     activeModelVisionCapable: Boolean,
     attachedDocuments: List<IndexedDocumentEntity>,
@@ -609,6 +645,7 @@ private fun FloatingComposerDock(
     onToggleThinking: () -> Unit,
     onAttachImageUri: (Uri) -> Unit,
     onClearPendingImage: () -> Unit,
+    onRemovePendingImage: (String) -> Unit,
     onAttachDocumentUri: (Uri) -> Unit,
     onRemoveDocument: (String) -> Unit,
     onExecuteSlashAction: (String) -> Unit,
@@ -630,9 +667,9 @@ private fun FloatingComposerDock(
     var showComposerMenu by remember { mutableStateOf(false) }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) onAttachImageUri(uri)
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 4)
+    ) { uris ->
+        uris.forEach { uri -> onAttachImageUri(uri) }
     }
 
     val documentPickerLauncher = rememberLauncherForActivityResult(
@@ -749,7 +786,7 @@ private fun FloatingComposerDock(
             }
 
             AnimatedVisibility(
-                visible = pendingImage != null || isPreparingImage,
+                visible = pendingImages.isNotEmpty() || isPreparingImage,
                 enter = if (reducedMotion) EnterTransition.None else (
                     fadeIn(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong)) +
                         expandVertically(tween(MotionTokens.DurationStandardMs, easing = MotionTokens.EaseOutStrong))
@@ -760,8 +797,7 @@ private fun FloatingComposerDock(
                     )
             ) {
                 PendingAttachmentCard(
-                    imageUri = pendingImage?.uriString,
-                    resolutionLabel = pendingImage?.let { "${it.width}×${it.height} RGB" },
+                    images = pendingImages,
                     isPreparing = isPreparingImage,
                     visionWarning = !activeModelVisionCapable,
                     onPickVisionPrompt = { quick -> promptInput = quick },
@@ -1031,7 +1067,7 @@ private fun FloatingComposerDock(
 
                     val actionMode = when {
                         isGenerating -> ComposerActionMode.STOP
-                        promptInput.isBlank() && pendingImage == null -> ComposerActionMode.MIC
+                        promptInput.isBlank() && pendingImages.isEmpty() -> ComposerActionMode.MIC
                         else -> ComposerActionMode.SEND
                     }
 
@@ -1125,7 +1161,7 @@ private fun FloatingComposerDock(
                             }
 
                             ComposerActionMode.SEND -> {
-                                val canSend = isReady && (promptInput.isNotBlank() || pendingImage != null)
+                                val canSend = isReady && (promptInput.isNotBlank() || pendingImages.isNotEmpty())
                                 Surface(
                                     onClick = {
                                         val text = promptInput

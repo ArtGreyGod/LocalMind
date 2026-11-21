@@ -65,7 +65,12 @@ data class PersistedAppSettings(
     val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
     val autoLoadLastModel: Boolean = true,
     val keepScreenOnDuringInference: Boolean = true,
-    val lastLoadedModelId: String? = null
+    val lastLoadedModelId: String? = null,
+    // Semantic (embedding-based) RAG reranking
+    val semanticRetrievalEnabled: Boolean = false,
+    val embeddingModelId: String? = null,
+    // Biometric app lock
+    val appLockEnabled: Boolean = false
 )
 
 class PreferencesRepository(private val context: Context) {
@@ -86,6 +91,9 @@ class PreferencesRepository(private val context: Context) {
         val autoLoadLastModel = booleanPreferencesKey("auto_load_last_model")
         val keepScreenOn = booleanPreferencesKey("keep_screen_on")
         val lastLoadedModelId = stringPreferencesKey("last_loaded_model_id")
+        val semanticRetrievalEnabled = booleanPreferencesKey("semantic_retrieval_enabled")
+        val embeddingModelId = stringPreferencesKey("embedding_model_id")
+        val appLockEnabled = booleanPreferencesKey("app_lock_enabled")
     }
 
     val settings: Flow<PersistedAppSettings> = context.settingsDataStore.data.map { prefs ->
@@ -115,7 +123,10 @@ class PreferencesRepository(private val context: Context) {
             themeMode = theme,
             autoLoadLastModel = prefs[Keys.autoLoadLastModel] ?: true,
             keepScreenOnDuringInference = prefs[Keys.keepScreenOn] ?: true,
-            lastLoadedModelId = prefs[Keys.lastLoadedModelId]
+            lastLoadedModelId = prefs[Keys.lastLoadedModelId],
+            semanticRetrievalEnabled = prefs[Keys.semanticRetrievalEnabled] ?: false,
+            embeddingModelId = prefs[Keys.embeddingModelId],
+            appLockEnabled = prefs[Keys.appLockEnabled] ?: false
         )
     }
 
@@ -160,6 +171,28 @@ class PreferencesRepository(private val context: Context) {
             } else {
                 prefs[Keys.lastLoadedModelId] = modelId
             }
+        }
+    }
+
+    suspend fun saveSemanticRetrieval(enabled: Boolean) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.semanticRetrievalEnabled] = enabled
+        }
+    }
+
+    suspend fun saveEmbeddingModelId(modelId: String?) {
+        context.settingsDataStore.edit { prefs ->
+            if (modelId == null) {
+                prefs.remove(Keys.embeddingModelId)
+            } else {
+                prefs[Keys.embeddingModelId] = modelId
+            }
+        }
+    }
+
+    suspend fun saveAppLockEnabled(enabled: Boolean) {
+        context.settingsDataStore.edit { prefs ->
+            prefs[Keys.appLockEnabled] = enabled
         }
     }
 }

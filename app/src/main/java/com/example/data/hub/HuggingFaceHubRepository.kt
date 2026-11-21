@@ -8,6 +8,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -15,6 +16,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -24,7 +27,9 @@ import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 
 @Serializable
 data class HfRepoApiItem(
@@ -45,7 +50,9 @@ data class HfTreeApiItem(
 
 @Serializable
 data class HfLfsMeta(
-    val size: Long = 0L
+    val size: Long = 0L,
+    /** LFS sha256 from the Hub tree API; used to verify download integrity. */
+    val oid: String? = null
 )
 
 data class HfRepoSummary(
@@ -63,7 +70,8 @@ data class HfModelFile(
     val sizeBytes: Long,
     val format: ModelFormat,
     val quantizationLabel: String,
-    val isMmproj: Boolean
+    val isMmproj: Boolean,
+    val sha256: String? = null
 ) {
     val taskId: String get() = "$repoId::$fileName"
     val downloadUrl: String get() = "https://huggingface.co/$repoId/resolve/main/$fileName?download=true"
@@ -85,7 +93,12 @@ data class ModelDownloadTask(
     val totalBytes: Long,
     val bytesPerSec: Long = 0L,
     val status: DownloadStatus,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    // Retained from the original tree-API entry so pause/resume never fabricates metadata.
+    val format: ModelFormat = ModelFormat.GGUF,
+    val quantizationLabel: String = "GGUF",
+    val isMmproj: Boolean = false,
+    val expectedSha256: String? = null
 ) {
     val fraction: Float
         get() = if (totalBytes > 0L) (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0f, 1f) else 0f
@@ -94,6 +107,13 @@ data class ModelDownloadTask(
 /**
  * Queries Hugging Face Hub public model APIs and executes resilient HTTP Byte-Range
  * resumable downloads into app-private storage, registering completed models automatically.
+ *
+ * Download guarantees:
+ * - Only one writer per task at a time (per-task mutex; pause cancels the OkHttp call).
+ * - Byte-range resumes validate the Content-Range start and treat "already complete"
+ *   (fully staged file or HTTP 416) as registration-ready instead of failing forever.
+ * - Completed byte counts are checked against the expected total, and LFS sha256
+ *   (when advertised) is verified before registration; corrupt artifacts never enter the vault.
  */
 class HuggingFaceHubRepository(
     private val context: Context,
@@ -109,12 +129,20 @@ class HuggingFaceHubRepository(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeJobs = mutableMapOf<String, Job>()
+    private val activeCalls = ConcurrentHashMap<String, okhttp3.Call>()
+    private val taskLocks = ConcurrentHashMap<String, Mutex>()
+    /** Original tree-API descriptors, kept so pause/resume never rebuilds fabricated stubs. */
+    private val taskSourceFiles = ConcurrentHashMap<String, HfModelFile>()
 
     private val stagingDir: File
         get() = File(context.filesDir, "downloads").apply { mkdirs() }
 
     private val _downloads = MutableStateFlow<Map<String, ModelDownloadTask>>(emptyMap())
     val downloads: StateFlow<Map<String, ModelDownloadTask>> = _downloads.asStateFlow()
+
+    init {
+        sweepOrphanedPartFiles()
+    }
 
     val curatedStarterRepos: List<HfRepoSummary> = listOf(
         HfRepoSummary(
@@ -213,6 +241,17 @@ class HuggingFaceHubRepository(
         }
     }
 
+    /**
+     * Re-enqueues a paused/failed task using the exact HfModelFile captured when it
+     * started. Safe to call after process restarts only while this repository instance
+     * still holds the descriptor (in-memory).
+     */
+    fun resumeTask(taskId: String): Boolean {
+        val file = taskSourceFiles[taskId] ?: return false
+        startOrResumeDownload(file) { }
+        return true
+    }
+
     fun startOrResumeDownload(
         file: HfModelFile,
         onCompleted: (Result<LocalModelEntry>) -> Unit
@@ -220,63 +259,90 @@ class HuggingFaceHubRepository(
         val taskId = file.taskId
         if (activeJobs[taskId]?.isActive == true) return
 
+        taskSourceFiles[taskId] = file
+        taskLocks.putIfAbsent(taskId, Mutex())
+
         val partFile = stagingPartFile(file.repoId, file.fileName)
         val existingBytes = if (partFile.exists()) partFile.length() else 0L
 
+        // A fully staged file that was never registered (process death between the final
+        // write and the registry write) must not re-download or fail with HTTP 416.
+        val alreadyComplete = file.sizeBytes > 0L && existingBytes >= file.sizeBytes
+
         _downloads.update { map ->
+            val previous = map[taskId]
             map + (
-                taskId to ModelDownloadTask(
+                taskId to (previous ?: ModelDownloadTask(
                     taskId = taskId,
                     repoId = file.repoId,
                     fileName = file.fileName,
                     downloadUrl = file.downloadUrl,
                     downloadedBytes = existingBytes,
                     totalBytes = file.sizeBytes,
-                    status = DownloadStatus.DOWNLOADING
+                    status = DownloadStatus.DOWNLOADING,
+                    format = file.format,
+                    quantizationLabel = file.quantizationLabel,
+                    isMmproj = file.isMmproj
+                )).copy(
+                    status = DownloadStatus.DOWNLOADING,
+                    errorMessage = null,
+                    format = file.format,
+                    quantizationLabel = file.quantizationLabel,
+                    isMmproj = file.isMmproj
                 )
                 )
         }
 
         val job = scope.launch {
-            try {
-                executeRangeDownload(file, partFile, existingBytes)
-                val regResult = modelRepository.registerDownloadedModelFile(partFile, file.fileName)
-                if (regResult.isSuccess) {
-                    _downloads.update { map ->
-                        val current = map[taskId]
-                        if (current != null) {
-                            map + (taskId to current.copy(status = DownloadStatus.COMPLETED, bytesPerSec = 0L))
-                        } else map
+            taskLocks.getValue(taskId).withLock {
+                try {
+                    if (!alreadyComplete) {
+                        executeRangeDownload(file, partFile)
                     }
-                } else {
+                    // Registration mutates DataStore; once started, finish it even if
+                    // the caller pauses the task so the vault never loses the file.
+                    val regResult = withContext(Dispatchers.IO + NonCancellable) {
+                        modelRepository.registerDownloadedModelFile(partFile, file.fileName)
+                    }
+                    if (regResult.isSuccess) {
+                        taskSourceFiles.remove(taskId)
+                        stagingPartFile(file.repoId, file.fileName).delete()
+                        _downloads.update { map ->
+                            val current = map[taskId]
+                            if (current != null) {
+                                map + (taskId to current.copy(status = DownloadStatus.COMPLETED, bytesPerSec = 0L))
+                            } else map
+                        }
+                    } else {
+                        _downloads.update { map ->
+                            val current = map[taskId]
+                            if (current != null) {
+                                map + (taskId to current.copy(
+                                    status = DownloadStatus.FAILED,
+                                    errorMessage = regResult.exceptionOrNull()?.message
+                                ))
+                            } else map
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        onCompleted(regResult)
+                    }
+                } catch (_: CancellationException) {
+                    // Pause/cancel: the .part file is preserved for the next resume.
+                } catch (e: Exception) {
                     _downloads.update { map ->
                         val current = map[taskId]
                         if (current != null) {
                             map + (taskId to current.copy(
                                 status = DownloadStatus.FAILED,
-                                errorMessage = regResult.exceptionOrNull()?.message
+                                bytesPerSec = 0L,
+                                errorMessage = e.message ?: "Download failed"
                             ))
                         } else map
                     }
-                }
-                withContext(Dispatchers.Main) {
-                    onCompleted(regResult)
-                }
-            } catch (_: CancellationException) {
-                // Preserved .part file on pause or cancellation handler handles deletion
-            } catch (e: Exception) {
-                _downloads.update { map ->
-                    val current = map[taskId]
-                    if (current != null) {
-                        map + (taskId to current.copy(
-                            status = DownloadStatus.FAILED,
-                            bytesPerSec = 0L,
-                            errorMessage = e.message ?: "Download failed"
-                        ))
-                    } else map
-                }
-                withContext(Dispatchers.Main) {
-                    onCompleted(Result.failure(e))
+                    withContext(Dispatchers.Main) {
+                        onCompleted(Result.failure(e))
+                    }
                 }
             }
         }
@@ -285,6 +351,7 @@ class HuggingFaceHubRepository(
 
     fun pauseDownload(taskId: String) {
         activeJobs.remove(taskId)?.cancel()
+        activeCalls.remove(taskId)?.cancel()
         _downloads.update { map ->
             val current = map[taskId] ?: return@update map
             map + (taskId to current.copy(status = DownloadStatus.PAUSED, bytesPerSec = 0L))
@@ -293,78 +360,186 @@ class HuggingFaceHubRepository(
 
     fun cancelDownload(taskId: String) {
         activeJobs.remove(taskId)?.cancel()
+        activeCalls.remove(taskId)?.cancel()
         val task = _downloads.value[taskId]
         if (task != null) {
             runCatching { stagingPartFile(task.repoId, task.fileName).delete() }
         }
+        taskSourceFiles.remove(taskId)
         _downloads.update { it - taskId }
     }
 
+    /**
+     * Removes staged .part files left behind by processes that died mid-download and
+     * were never resumed. Recent files (<= 7 days) are kept so their byte data can
+     * still be resumed within this session; everything older is reclaimed.
+     */
+    private fun sweepOrphanedPartFiles() {
+        runCatching {
+            val cutoff = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
+            stagingDir.listFiles { file -> file.name.endsWith(".part") && file.lastModified() < cutoff }
+                ?.forEach { file ->
+                    runCatching { file.delete() }
+                }
+        }
+    }
+
+    /**
+     * One range-download attempt. Throws [HttpRestart] when the server response makes a
+     * byte-range append unsafe (mismatched Content-Range or a full 200 body after a resume),
+     * in which case the caller restarts cleanly from byte 0.
+     */
+    private class HttpRestart : RuntimeException()
+
     private fun CoroutineScope.executeRangeDownload(
         file: HfModelFile,
+        partFile: File
+    ) {
+        val taskId = file.taskId
+        var restarted = false
+        while (true) {
+            val resumeOffset = if (partFile.exists()) partFile.length() else 0L
+            if (file.sizeBytes in 1 until resumeOffset) {
+                // Stale .part from an older revision of this repo file; a byte-range
+                // append would produce a corrupt hybrid file. Restart from scratch.
+                runCatching { partFile.delete() }
+                if (restarted) error("Unable to reconcile staged download for ${file.fileName}; restart the download.")
+                restarted = true
+                continue
+            }
+
+            val requestBuilder = Request.Builder().url(file.downloadUrl)
+            if (resumeOffset > 0L) {
+                requestBuilder.header("Range", "bytes=$resumeOffset-")
+            }
+            val call = client.newCall(requestBuilder.build())
+            activeCalls[taskId] = call
+            try {
+                runRangeAttempt(file, partFile, call, resumeOffset)
+                return
+            } catch (restart: HttpRestart) {
+                if (restarted) error("Download stream could not be aligned for ${file.fileName}; restart the download.")
+                runCatching { partFile.delete() }
+                restarted = true
+            } finally {
+                activeCalls.remove(taskId)
+            }
+        }
+    }
+
+    private fun CoroutineScope.runRangeAttempt(
+        file: HfModelFile,
         partFile: File,
+        call: okhttp3.Call,
         resumeOffset: Long
     ) {
-        val reqBuilder = Request.Builder().url(file.downloadUrl)
-        if (resumeOffset > 0L) {
-            reqBuilder.header("Range", "bytes=$resumeOffset-")
-        }
-        client.newCall(reqBuilder.build()).execute().use { response ->
-            if (!response.isSuccessful && response.code != 206) {
-                error("Download failed with HTTP ${response.code}")
+        val taskId = file.taskId
+        var contentRange: String? = null
+        call.execute().use { response ->
+            when {
+                response.code == 416 && file.sizeBytes > 0L && resumeOffset >= file.sizeBytes -> {
+                    // Everything requested is already staged (e.g. the previous run died
+                    // between the final write and registration); proceed to registration.
+                    return
+                }
+                response.code == 206 -> {
+                    contentRange = response.header("Content-Range")
+                    val serverStart = contentRange?.substringAfter(" ")?.substringBefore("-")?.trim()?.toLongOrNull()
+                    if (serverStart != null && serverStart != resumeOffset) {
+                        throw HttpRestart()
+                    }
+                }
+                response.code == 200 && resumeOffset > 0L -> throw HttpRestart()
+                !response.isSuccessful -> error("Download failed with HTTP ${response.code}")
             }
             val body = response.body ?: error("Empty download response")
             val isPartial = response.code == 206
             val append = isPartial && resumeOffset > 0L
             val startingBytes = if (append) resumeOffset else 0L
             val contentLength = body.contentLength()
+            val rangeTotal = contentRange?.substringAfterLast('/')?.trim()?.toLongOrNull()
             val expectedTotal = when {
                 file.sizeBytes > 0L -> file.sizeBytes
+                isPartial && rangeTotal != null && rangeTotal > 0L -> rangeTotal
                 contentLength > 0L -> startingBytes + contentLength
                 else -> 0L
             }
 
+            val digest = file.sha256?.takeIf { it.length == 64 }?.let {
+                runCatching { MessageDigest.getInstance("SHA-256") }.getOrNull()
+            }
             var copied = startingBytes
             var lastTickNs = System.nanoTime()
             var bytesSinceTick = 0L
 
-            body.byteStream().use { input ->
-                FileOutputStream(partFile, append).use { output ->
-                    val buffer = ByteArray(128 * 1024)
-                    while (isActive) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        output.write(buffer, 0, read)
-                        copied += read
-                        bytesSinceTick += read
+            try {
+                body.byteStream().use { input ->
+                    FileOutputStream(partFile, append).use { output ->
+                        val buffer = ByteArray(128 * 1024)
+                        while (isActive) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                            digest?.update(buffer, 0, read)
+                            copied += read
+                            bytesSinceTick += read
 
-                        val nowNs = System.nanoTime()
-                        val elapsedMs = (nowNs - lastTickNs) / 1_000_000L
-                        if (elapsedMs >= 350L) {
-                            val speed = (bytesSinceTick * 1000L) / elapsedMs.coerceAtLeast(1L)
-                            lastTickNs = nowNs
-                            bytesSinceTick = 0L
-                            _downloads.update { map ->
-                                val prev = map[file.taskId] ?: return@update map
-                                map + (
-                                    file.taskId to prev.copy(
-                                        downloadedBytes = copied,
-                                        totalBytes = expectedTotal,
-                                        bytesPerSec = speed,
-                                        status = DownloadStatus.DOWNLOADING
-                                    )
-                                    )
+                            val nowNs = System.nanoTime()
+                            val elapsedMs = (nowNs - lastTickNs) / 1_000_000L
+                            if (elapsedMs >= 350L) {
+                                val speed = (bytesSinceTick * 1000L) / elapsedMs.coerceAtLeast(1L)
+                                lastTickNs = nowNs
+                                bytesSinceTick = 0L
+                                _downloads.update { map ->
+                                    val prev = map[taskId] ?: return@update map
+                                    map + (
+                                        taskId to prev.copy(
+                                            downloadedBytes = copied,
+                                            totalBytes = expectedTotal,
+                                            bytesPerSec = speed,
+                                            status = DownloadStatus.DOWNLOADING
+                                        )
+                                        )
+                                }
                             }
                         }
+                        output.flush()
                     }
-                    output.flush()
+                }
+            } catch (io: java.io.IOException) {
+                if (call.isCanceled()) {
+                    // A deliberate pause/cancel must surface as cancellation, not failure.
+                    throw CancellationException("Download paused")
+                }
+                throw io
+            }
+
+            // Integrity gate 1: byte count. A short-but-clean stream close (CDN edge
+            // error, proxy truncation) must never register a truncated GGUF. Keep the
+            // .part file so the user can resume the remainder.
+            if (expectedTotal > 0L && copied != expectedTotal) {
+                error(
+                    "Download incomplete: got $copied of $expectedTotal bytes. " +
+                        "Tap resume to continue from where it stopped."
+                )
+            }
+
+            // Integrity gate 2: content hash advertised by the Hub for this file.
+            if (digest != null) {
+                val actual = digest.digest().joinToString("") { "%02x".format(it) }
+                if (!actual.equals(file.sha256, ignoreCase = true)) {
+                    runCatching { stagingPartFile(file.repoId, file.fileName).delete() }
+                    error(
+                        "Downloaded file failed integrity verification (sha256 mismatch). " +
+                            "The staging file was removed; please re-download."
+                    )
                 }
             }
 
             _downloads.update { map ->
-                val prev = map[file.taskId] ?: return@update map
+                val prev = map[taskId] ?: return@update map
                 map + (
-                    file.taskId to prev.copy(
+                    taskId to prev.copy(
                         downloadedBytes = copied,
                         totalBytes = expectedTotal.coerceAtLeast(copied)
                     )
@@ -394,7 +569,8 @@ class HuggingFaceHubRepository(
                         sizeBytes = totalSize,
                         format = format,
                         quantizationLabel = inferQuant(name, format),
-                        isMmproj = isMmproj
+                        isMmproj = isMmproj,
+                        sha256 = item.lfs?.oid?.takeIf { it.length == 64 }
                     )
                 }
                 .sortedWith(compareBy({ it.isMmproj }, { it.sizeBytes }))

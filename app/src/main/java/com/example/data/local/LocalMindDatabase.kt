@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Entity
+import androidx.room.Fts4
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.Insert
@@ -17,7 +18,9 @@ import androidx.room.Update
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
+import kotlinx.serialization.Serializable
 
+@Serializable
 @Entity(tableName = "workspaces")
 data class WorkspaceEntity(
     @PrimaryKey val id: String,
@@ -29,6 +32,7 @@ data class WorkspaceEntity(
     val updatedAtMillis: Long = System.currentTimeMillis()
 )
 
+@Serializable
 @Entity(
     tableName = "chat_threads",
     foreignKeys = [
@@ -50,10 +54,14 @@ data class ChatThreadEntity(
     val lastModelId: String? = null,
     val lastModelName: String? = null,
     val trimBeforeTurnOrder: Int = 0,
+    // Rolling model-generated summary of turns below the trim boundary (conversation memory).
+    val memorySummary: String? = null,
+    val summaryUntilTurnOrder: Int = 0,
     val createdAtMillis: Long = System.currentTimeMillis(),
     val updatedAtMillis: Long = System.currentTimeMillis()
 )
 
+@Serializable
 @Entity(
     tableName = "chat_messages",
     foreignKeys = [
@@ -77,14 +85,38 @@ data class ChatMessageEntity(
     val text: String,
     val thinkingText: String = "",
     val imageUriString: String? = null,
+    /** JSON array of all attached image URIs (multi-image turns); first mirrors imageUriString. */
+    val imageUrisJson: String? = null,
     val citationsJson: String? = null,
     val telemetryJson: String? = null,
     val isInterrupted: Boolean = false,
     val timestampMillis: Long = System.currentTimeMillis()
 )
 
+/** Mirror of [ChatMessageEntity.text] for full-text search; rowids match the content table. */
+@Fts4(contentEntity = ChatMessageEntity::class)
+@Entity(tableName = "chat_messages_fts")
+data class ChatMessageFtsEntity(
+    val text: String
+)
+
+@Serializable
 @Entity(
     tableName = "indexed_documents",
+    foreignKeys = [
+        ForeignKey(
+            entity = ChatThreadEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["threadId"],
+            onDelete = ForeignKey.CASCADE
+        ),
+        ForeignKey(
+            entity = WorkspaceEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["workspaceId"],
+            onDelete = ForeignKey.CASCADE
+        )
+    ],
     indices = [Index("threadId"), Index("workspaceId")]
 )
 data class IndexedDocumentEntity(
@@ -182,6 +214,11 @@ interface ChatThreadDao {
     @Query("UPDATE chat_threads SET trimBeforeTurnOrder = :turnOrder, updatedAtMillis = :updatedAt WHERE id = :id")
     suspend fun setTrimBeforeTurnOrder(id: String, turnOrder: Int, updatedAt: Long)
 
+    @Query(
+        "UPDATE chat_threads SET memorySummary = :summary, summaryUntilTurnOrder = :untilTurn, updatedAtMillis = :updatedAt WHERE id = :id"
+    )
+    suspend fun setMemorySummary(id: String, summary: String?, untilTurn: Int, updatedAt: Long)
+
     @Query("DELETE FROM chat_threads WHERE id = :id")
     suspend fun deleteById(id: String)
 }
@@ -231,6 +268,21 @@ interface ChatMessageDao {
 
     @Query("DELETE FROM chat_messages WHERE threadId = :threadId")
     suspend fun clearThread(threadId: String)
+
+    /** Atomically replaces the active branch of a group: deactivate, then upsert. */
+    @Transaction
+    suspend fun replaceActiveBranch(threadId: String, groupId: String, message: ChatMessageEntity) {
+        deactivateBranchesInGroup(threadId, groupId)
+        upsert(message)
+    }
+
+    @Query(
+        "SELECT chat_messages.* FROM chat_messages " +
+            "INNER JOIN chat_messages_fts ON chat_messages.rowid = chat_messages_fts.rowid " +
+            "WHERE chat_messages_fts MATCH :query " +
+            "ORDER BY chat_messages.timestampMillis DESC LIMIT :limit"
+    )
+    suspend fun searchMessages(query: String, limit: Int): List<ChatMessageEntity>
 }
 
 @Dao
@@ -283,12 +335,13 @@ interface PromptTemplateDao {
         WorkspaceEntity::class,
         ChatThreadEntity::class,
         ChatMessageEntity::class,
+        ChatMessageFtsEntity::class,
         IndexedDocumentEntity::class,
         DocumentChunkEntity::class,
         PromptTemplateEntity::class
     ],
-    version = 2,
-    exportSchema = false
+    version = 3,
+    exportSchema = true
 )
 abstract class LocalMindDatabase : RoomDatabase() {
     abstract fun workspaceDao(): WorkspaceDao
@@ -306,13 +359,81 @@ abstract class LocalMindDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Multi-image attachment history
+                db.execSQL("ALTER TABLE chat_messages ADD COLUMN imageUrisJson TEXT")
+
+                // Conversation-memory columns on threads
+                db.execSQL("ALTER TABLE chat_threads ADD COLUMN memorySummary TEXT")
+                db.execSQL(
+                    "ALTER TABLE chat_threads ADD COLUMN summaryUntilTurnOrder INTEGER NOT NULL DEFAULT 0"
+                )
+
+                // Full-text search mirror of chat_messages.text, kept in sync by content triggers
+                db.execSQL(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS `chat_messages_fts` USING FTS4(`text` TEXT NOT NULL, content=`chat_messages`)"
+                )
+                db.execSQL(
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_BEFORE_UPDATE " +
+                        "BEFORE UPDATE ON `chat_messages` BEGIN DELETE FROM `chat_messages_fts` WHERE `docid`=OLD.`rowid`; END"
+                )
+                db.execSQL(
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_BEFORE_DELETE " +
+                        "BEFORE DELETE ON `chat_messages` BEGIN DELETE FROM `chat_messages_fts` WHERE `docid`=OLD.`rowid`; END"
+                )
+                db.execSQL(
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_AFTER_UPDATE " +
+                        "AFTER UPDATE ON `chat_messages` BEGIN INSERT INTO `chat_messages_fts`(`docid`, `text`) VALUES (NEW.`rowid`, NEW.`text`); END"
+                )
+                db.execSQL(
+                    "CREATE TRIGGER IF NOT EXISTS room_fts_content_sync_chat_messages_fts_AFTER_INSERT " +
+                        "AFTER INSERT ON `chat_messages` BEGIN INSERT INTO `chat_messages_fts`(`docid`, `text`) VALUES (NEW.`rowid`, NEW.`text`); END"
+                )
+                db.execSQL("INSERT INTO chat_messages_fts(chat_messages_fts) VALUES('rebuild')")
+
+                // Re-create indexed_documents with cascade FKs so documents/chunks die with
+                // their thread or workspace instead of leaking forever.
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `indexed_documents_new` (" +
+                        "`id` TEXT NOT NULL, `threadId` TEXT, `workspaceId` TEXT, " +
+                        "`displayName` TEXT NOT NULL, `mimeType` TEXT NOT NULL, " +
+                        "`chunkCount` INTEGER NOT NULL, `charCount` INTEGER NOT NULL, " +
+                        "`createdAtMillis` INTEGER NOT NULL, PRIMARY KEY(`id`), " +
+                        "FOREIGN KEY(`threadId`) REFERENCES `chat_threads`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE, " +
+                        "FOREIGN KEY(`workspaceId`) REFERENCES `workspaces`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE)"
+                )
+                db.execSQL(
+                    "INSERT INTO `indexed_documents_new` " +
+                        "(`id`, `threadId`, `workspaceId`, `displayName`, `mimeType`, `chunkCount`, `charCount`, `createdAtMillis`) " +
+                        "SELECT `id`, `threadId`, `workspaceId`, `displayName`, `mimeType`, `chunkCount`, `charCount`, `createdAtMillis` " +
+                        "FROM `indexed_documents`"
+                )
+                db.execSQL("DROP TABLE `indexed_documents`")
+                db.execSQL("ALTER TABLE `indexed_documents_new` RENAME TO `indexed_documents`")
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_indexed_documents_threadId` ON `indexed_documents` (`threadId`)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_indexed_documents_workspaceId` ON `indexed_documents` (`workspaceId`)"
+                )
+                // Drop pre-migration rows whose owners are already gone (they were unreachable leaks)
+                db.execSQL(
+                    "DELETE FROM indexed_documents WHERE threadId IS NOT NULL AND threadId NOT IN (SELECT id FROM chat_threads)"
+                )
+                db.execSQL(
+                    "DELETE FROM indexed_documents WHERE workspaceId IS NOT NULL AND workspaceId NOT IN (SELECT id FROM workspaces)"
+                )
+            }
+        }
+
         fun create(context: Context): LocalMindDatabase {
             return Room.databaseBuilder(
                 context.applicationContext,
                 LocalMindDatabase::class.java,
                 "localmind_studio.db"
             )
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                 .build()
         }
 

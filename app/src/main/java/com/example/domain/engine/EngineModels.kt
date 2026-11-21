@@ -75,12 +75,15 @@ data class PreparedImage(
 
 data class InferenceInput(
     val prompt: String,
-    val imageAttachment: PreparedImage? = null,
+    val imageAttachments: List<PreparedImage> = emptyList(),
     val maxTokens: Int = 512,
     val enableThinking: Boolean = true,
     val thinkingBudgetTokens: Int = 1024,
     val systemPrompt: String? = null
-)
+) {
+    val imageAttachment: PreparedImage?
+        get() = imageAttachments.firstOrNull()
+}
 
 @Serializable
 data class GenerationTelemetry(
@@ -145,7 +148,12 @@ data class LocalModelEntry(
     val mmprojFilePath: String? = null,
     val mmprojFileName: String? = null,
     val mmprojSizeBytes: Long = 0L,
-    val importedAtMillis: Long
+    val importedAtMillis: Long,
+    // Parsed from the GGUF header on import (null for non-GGUF or unparsed files).
+    val architecture: String? = null,
+    val trainedContextLength: Int? = null,
+    val blockCount: Int? = null,
+    val parameterCount: Long? = null
 ) {
     val isVisionCapable: Boolean
         get() = supportsNativeVision || (format == ModelFormat.GGUF && !mmprojFilePath.isNullOrBlank())

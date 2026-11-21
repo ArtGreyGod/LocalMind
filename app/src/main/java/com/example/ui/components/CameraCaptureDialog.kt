@@ -142,7 +142,13 @@ fun CameraCaptureDialog(
                 DisposableEffect(lifecycleOwner) {
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
                     val mainExecutor = ContextCompat.getMainExecutor(context)
-                    cameraProviderFuture.addListener({
+                    var bound = false
+                    var disposableActive = true
+
+                    val listener = Runnable {
+                        // Skip binding entirely if the dialog was dismissed during init;
+                        // otherwise the camera would stay open after disposal.
+                        if (!disposableActive) return@Runnable
                         runCatching {
                             val provider = cameraProviderFuture.get()
                             val preview = Preview.Builder().build().also {
@@ -155,14 +161,25 @@ fun CameraCaptureDialog(
                                 preview,
                                 imageCapture
                             )
+                            bound = true
                         }.onFailure { err ->
                             Log.e("CameraCaptureDialog", "Camera bind failed", err)
                             cameraError = err.message ?: "Unable to start camera preview"
                         }
-                    }, mainExecutor)
+                    }
+                    cameraProviderFuture.addListener(listener, mainExecutor)
 
                     onDispose {
-                        runCatching { cameraProviderFuture.get().unbindAll() }
+                        disposableActive = false
+                        // Never call .get() here: it can block the main thread while the
+                        // provider future is still initializing. If already bound, unbind
+                        // immediately; if still initializing, the guarded listener above
+                        // will not bind at all.
+                        if (bound) {
+                            runCatching { cameraProviderFuture.get().unbindAll() }
+                        } else {
+                            cameraProviderFuture.cancel(true)
+                        }
                     }
                 }
 

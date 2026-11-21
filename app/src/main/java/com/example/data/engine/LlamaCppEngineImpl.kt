@@ -80,9 +80,9 @@ internal object LlamaCppNativeBridge {
     external fun nativeGenerateStream(
         systemPrompt: String?,
         userPrompt: String,
-        rgbBytes: ByteArray?,
-        imgWidth: Int,
-        imgHeight: Int,
+        rgbPlanes: Array<ByteArray>?,
+        imgWidths: IntArray?,
+        imgHeights: IntArray?,
         maxTokens: Int,
         enableThinking: Boolean,
         thinkingBudgetTokens: Int,
@@ -94,6 +94,14 @@ internal object LlamaCppNativeBridge {
     external fun nativeResetContext()
     external fun nativeUnloadModel()
     external fun nativeGetStatsJson(): String
+
+    external fun nativeLoadEmbeddingModel(modelPath: String, nCtx: Int, nThreads: Int)
+    external fun nativeUnloadEmbeddingModel()
+    external fun nativeEmbedText(text: String): FloatArray?
+    external fun nativeIsEmbeddingModelLoaded(): Boolean
+    external fun nativeSaveSessionState(path: String): Boolean
+    external fun nativeLoadSessionState(path: String): Boolean
+    external fun nativeGetRecentLogs(): String
 }
 
 @Serializable
@@ -338,13 +346,13 @@ class LlamaCppEngineImpl(
             }
 
             try {
-                val img = input.imageAttachment
+                val images = input.imageAttachments
                 val rc = LlamaCppNativeBridge.nativeGenerateStream(
                     systemPrompt = input.systemPrompt ?: config.systemPrompt,
                     userPrompt = input.prompt,
-                    rgbBytes = img?.rgbBytes,
-                    imgWidth = img?.width ?: 0,
-                    imgHeight = img?.height ?: 0,
+                    rgbPlanes = images.takeIf { it.isNotEmpty() }?.map { it.rgbBytes }?.toTypedArray(),
+                    imgWidths = images.takeIf { it.isNotEmpty() }?.map { it.width }?.toIntArray(),
+                    imgHeights = images.takeIf { it.isNotEmpty() }?.map { it.height }?.toIntArray(),
                     maxTokens = input.maxTokens,
                     enableThinking = input.enableThinking,
                     thinkingBudgetTokens = input.thinkingBudgetTokens,
@@ -437,6 +445,54 @@ class LlamaCppEngineImpl(
         // Warn-first policy handled by InferenceEngineCoordinator; never silently unload mid-chat.
         Log.i(TAG, "onTrimMemory($level): retaining loaded llama.cpp model per warn-first policy")
     }
+
+    override suspend fun saveSessionState(path: String): Boolean =
+        withContext(engineDispatcher) {
+            LlamaCppNativeBridge.isLibraryLoaded && runCatching {
+                LlamaCppNativeBridge.nativeSaveSessionState(path)
+            }.getOrDefault(false)
+        }
+
+    override suspend fun loadSessionState(path: String): Boolean =
+        withContext(engineDispatcher) {
+            LlamaCppNativeBridge.isLibraryLoaded && runCatching {
+                LlamaCppNativeBridge.nativeLoadSessionState(path)
+            }.getOrDefault(false)
+        }
+
+    override suspend fun loadEmbeddingModel(modelPath: String, contextLength: Int) {
+        withContext(engineDispatcher) {
+            if (!LlamaCppNativeBridge.isLibraryLoaded) return@withContext
+            runCatching {
+                LlamaCppNativeBridge.nativeLoadEmbeddingModel(
+                    modelPath = modelPath,
+                    nCtx = contextLength,
+                    nThreads = max(2, Runtime.getRuntime().availableProcessors() / 2)
+                )
+            }.onFailure { Log.w(TAG, "Embedding model load failed", it) }
+        }
+    }
+
+    override suspend fun unloadEmbeddingModel() {
+        withContext(engineDispatcher) {
+            if (LlamaCppNativeBridge.isLibraryLoaded) {
+                runCatching { LlamaCppNativeBridge.nativeUnloadEmbeddingModel() }
+            }
+        }
+    }
+
+    override suspend fun isEmbeddingAvailable(): Boolean =
+        LlamaCppNativeBridge.isLibraryLoaded &&
+            runCatching { LlamaCppNativeBridge.nativeIsEmbeddingModelLoaded() }.getOrDefault(false)
+
+    override suspend fun embedText(text: String): FloatArray? =
+        withContext(engineDispatcher) {
+            if (!LlamaCppNativeBridge.isLibraryLoaded) return@withContext null
+            runCatching { LlamaCppNativeBridge.nativeEmbedText(text) }.getOrNull()
+        }
+
+    override suspend fun recentNativeLogs(): String =
+        runCatching { LlamaCppNativeBridge.nativeGetRecentLogs() }.getOrDefault("")
 
     private fun releaseInternalLocked() {
         if (LlamaCppNativeBridge.isLibraryLoaded) {

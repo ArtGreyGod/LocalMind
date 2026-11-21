@@ -1,6 +1,7 @@
 package com.example.data.local
 
 import androidx.compose.runtime.Immutable
+import androidx.room.withTransaction
 import com.example.data.storage.SystemPromptPresets
 import com.example.domain.engine.GenerationTelemetry
 import com.example.ui.viewmodel.ChatMessageUi
@@ -36,6 +37,7 @@ class ChatHistoryRepository(
 ) {
     companion object {
         const val DEFAULT_WORKSPACE_ID = "workspace_general"
+        const val EXPORT_FORMAT_VERSION = 1
     }
 
     private val json = Json {
@@ -48,6 +50,7 @@ class ChatHistoryRepository(
     private val threadDao = database.chatThreadDao()
     private val messageDao = database.chatMessageDao()
     private val templateDao = database.promptTemplateDao()
+    private val documentDao = database.documentDao()
 
     val workspaces: Flow<List<WorkspaceEntity>> = workspaceDao.observeAll()
     val threads: Flow<List<ChatThreadEntity>> = threadDao.observeAll()
@@ -195,8 +198,38 @@ class ChatHistoryRepository(
         threadDao.setTrimBeforeTurnOrder(threadId, trimBeforeTurnOrder, System.currentTimeMillis())
     }
 
+    suspend fun setThreadMemorySummary(threadId: String, summary: String?, untilTurnOrder: Int) {
+        threadDao.setMemorySummary(threadId, summary, untilTurnOrder, System.currentTimeMillis())
+    }
+
+    suspend fun searchMessages(query: String, limit: Int = 40): List<ChatMessageEntity> {
+        // Escape FTS4 syntax characters so user input is treated as literal terms.
+        val sanitized = query.trim()
+            .replace(Regex("[\"*()^:]"), " ")
+            .split(Regex("\\s+"))
+            .filter { it.isNotBlank() }
+            .map { term -> "\"$term\"" }
+            .joinToString(" ")
+        if (sanitized.isBlank()) return emptyList()
+        return runCatching { messageDao.searchMessages(sanitized, limit) }.getOrDefault(emptyList())
+    }
+
     suspend fun deleteThread(threadId: String) {
         threadDao.deleteById(threadId)
+    }
+
+    /** Snapshots a thread and all its message revisions so an undo can restore it fully. */
+    suspend fun snapshotThreadForUndo(threadId: String): ThreadExport? {
+        val thread = threadDao.getById(threadId) ?: return null
+        val messages = messageDao.getForThread(threadId)
+        return ThreadExport(thread = thread, messages = messages)
+    }
+
+    suspend fun restoreThreadSnapshot(snapshot: ThreadExport) {
+        database.withTransaction {
+            threadDao.insert(snapshot.thread)
+            messageDao.upsertAll(snapshot.messages)
+        }
     }
 
     suspend fun saveMessage(
@@ -208,9 +241,6 @@ class ChatHistoryRepository(
         isActiveBranch: Boolean = true
     ) {
         if (threadDao.getById(threadId) == null) return
-        if (isActiveBranch) {
-            messageDao.deactivateBranchesInGroup(threadId, branchGroupId)
-        }
         val safeTelemetry = message.telemetry?.let { t ->
             t.copy(
                 prefillTokensPerSec = t.prefillTokensPerSec.takeIf { it.isFinite() } ?: 0.0,
@@ -223,6 +253,9 @@ class ChatHistoryRepository(
         val encodedTelemetry = safeTelemetry?.let { t ->
             runCatching { json.encodeToString(t) }.getOrNull()
         }
+        val encodedImageUris = message.imageUris.takeIf { it.isNotEmpty() }?.let { list ->
+            runCatching { json.encodeToString(list) }.getOrNull()
+        }
         val entity = ChatMessageEntity(
             id = message.id,
             threadId = threadId,
@@ -234,13 +267,18 @@ class ChatHistoryRepository(
             text = message.text,
             thinkingText = message.thinkingText,
             imageUriString = message.imageUriString,
+            imageUrisJson = encodedImageUris,
             citationsJson = encodedCitations,
             telemetryJson = encodedTelemetry,
             isInterrupted = message.isInterrupted,
             timestampMillis = message.timestampMillis
         )
         runCatching {
-            messageDao.upsert(entity)
+            if (isActiveBranch) {
+                messageDao.replaceActiveBranch(threadId, branchGroupId, entity)
+            } else {
+                messageDao.upsert(entity)
+            }
             threadDao.touchUpdatedAt(threadId, System.currentTimeMillis())
         }
     }
@@ -305,13 +343,16 @@ class ChatHistoryRepository(
                 runCatching { json.decodeFromString<GenerationTelemetry>(it) }.getOrNull()
             }
             val role = runCatching { ChatRole.valueOf(active.role) }.getOrDefault(ChatRole.ASSISTANT)
+            val imageUris = active.imageUrisJson?.let {
+                runCatching { json.decodeFromString<List<String>>(it) }.getOrNull()
+            } ?: listOfNotNull(active.imageUriString)
             result += ChatMessageUi(
                 id = active.id,
                 role = role,
                 text = active.text,
                 thinkingText = active.thinkingText,
                 isThinking = false,
-                imageUriString = active.imageUriString,
+                imageUris = imageUris,
                 isStreaming = false,
                 isInterrupted = active.isInterrupted,
                 telemetry = telemetry,
@@ -343,5 +384,55 @@ class ChatHistoryRepository(
 
     suspend fun deleteCustomTemplate(id: String) {
         templateDao.deleteCustom(id)
+    }
+
+    // --- Full-fidelity thread export / import (branches, thoughts, telemetry, citations) ---
+
+    @Serializable
+    data class ThreadExport(
+        val format: String = "localmind-thread",
+        val version: Int = EXPORT_FORMAT_VERSION,
+        val thread: ChatThreadEntity,
+        val workspaceName: String? = null,
+        val messages: List<ChatMessageEntity>
+    )
+
+    suspend fun exportThreadJson(threadId: String): String? {
+        val thread = threadDao.getById(threadId) ?: return null
+        val messages = messageDao.getForThread(threadId)
+        val workspaceName = thread.workspaceId?.let { workspaceDao.getById(it)?.name }
+        return json.encodeToString(
+            ThreadExport(thread = thread, workspaceName = workspaceName, messages = messages)
+        )
+    }
+
+    suspend fun importThreadJson(raw: String): Result<ChatThreadEntity> = runCatching {
+        val export = json.decodeFromString<ThreadExport>(raw)
+        require(export.format == "localmind-thread") { "Not a LocalMind thread export" }
+
+        val newThreadId = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        val workspaceId = export.thread.workspaceId?.let { wsId ->
+            if (workspaceDao.getById(wsId) != null) wsId else null
+        }
+        val newThread = export.thread.copy(
+            id = newThreadId,
+            workspaceId = workspaceId,
+            isArchived = false,
+            isPinned = false,
+            createdAtMillis = now,
+            updatedAtMillis = now
+        )
+        val idMap = export.messages.associate { it.id to UUID.randomUUID().toString() }
+        val newMessages = export.messages.map { msg ->
+            msg.copy(id = idMap.getValue(msg.id), threadId = newThreadId)
+        }
+
+        // Insert in one transaction: thread first (FK parent), then all messages.
+        database.withTransaction {
+            threadDao.insert(newThread)
+            messageDao.upsertAll(newMessages)
+        }
+        newThread
     }
 }

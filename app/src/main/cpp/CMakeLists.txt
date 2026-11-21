@@ -6,9 +6,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(ENABLE_VULKAN "Enable Vulkan GPU offloading via ggml-vulkan" OFF)
+option(ENABLE_VULKAN "Enable Vulkan GPU offloading via ggml-vulkan" ON)
 option(ENABLE_OPENCL "Enable OpenCL GPU offloading via ggml-opencl" OFF)
 set(LLAMA_CPP_DIR "" CACHE PATH "Optional local path to llama.cpp checkout")
+
+# Pinned llama.cpp release; the JNI bridge compiles against this exact API set.
+# Bump deliberately (and re-verify llama_jni.cpp) when upgrading.
+set(LLAMA_CPP_TAG "v1.0.0" CACHE STRING "llama.cpp git tag / commit to build against")
 
 # Configure llama.cpp / ggml options before adding subdirectory
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -33,7 +37,52 @@ if (DEFINED ANDROID_ABI AND ANDROID_ABI STREQUAL "arm64-v8a")
 endif()
 
 if (ENABLE_VULKAN)
-    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+    # ggml-vulkan precompiles its shaders with a host-side glslc. If it is not
+    # installed, degrade gracefully to CPU-only instead of failing the build
+    # (CI installs glslc; local dev machines may not have it).
+    find_program(GLSLC_EXECUTABLE glslc)
+    if (GLSLC_EXECUTABLE)
+        set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+        message(STATUS "Vulkan GPU offload enabled (glslc: ${GLSLC_EXECUTABLE})")
+        # ggml-vulkan requires the Khronos SPIRV-Headers config package at configure
+        # time; fetch a pinned copy so no host SDK install is required. Needs CMake
+        # >= 3.24 (the Gradle build pins cmake;3.30.3) for OVERRIDE_FIND_PACKAGE.
+        include(FetchContent)
+        # The name must match what ggml-vulkan passes to find_package() (case-insensitive
+        # hyphenated form) for OVERRIDE_FIND_PACKAGE redirection to take effect.
+        FetchContent_Declare(
+            SPIRV-Headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+            GIT_TAG vulkan-sdk-1.4.350.1
+            GIT_SHALLOW TRUE
+            OVERRIDE_FIND_PACKAGE
+        )
+        FetchContent_MakeAvailable(SPIRV-Headers)
+        include_directories(${SPIRV-Headers_SOURCE_DIR}/include)
+        set(LLAMA_VULKAN_SHIM_SOURCE vulkan_api_shim.cpp)
+        # The NDK ships C Vulkan headers only; ggml-vulkan also needs the C++ bindings.
+        # Tag must match the NDK sysroot's VK_HEADER_VERSION exactly (static assertion).
+        FetchContent_Declare(
+            Vulkan-Hpp
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Hpp.git
+            GIT_TAG v1.3.275
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(Vulkan-Hpp)
+        include_directories(${vulkan-hpp_SOURCE_DIR})
+        if (CMAKE_HOST_APPLE)
+            # ggml-vulkan compiles a host-side shader-gen tool. Its compiler probe tries
+            # gcc first, which is a non-functional stub on macOS; pre-seed its cache
+            # variables with Apple's clang from /usr/bin (NOT the NDK cross-compiler that
+            # find_program would otherwise pick up). NOTE: key off CMAKE_HOST_APPLE — the
+            # build target is Android, so APPLE refers to the wrong platform here.
+            find_program(HOST_C_COMPILER clang PATHS /usr/bin NO_DEFAULT_PATH)
+            find_program(HOST_CXX_COMPILER clang++ PATHS /usr/bin NO_DEFAULT_PATH)
+        endif()
+    else()
+        message(WARNING "ENABLE_VULKAN=ON but glslc was not found on the host; building CPU-only. Install shaderc/glslc to enable Vulkan GPU offloading.")
+        set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    endif()
 endif()
 
 if (ENABLE_OPENCL)
@@ -49,7 +98,7 @@ else()
     FetchContent_Declare(
         llama_cpp
         GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-        GIT_TAG master
+        GIT_TAG ${LLAMA_CPP_TAG}
         GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(llama_cpp)
@@ -58,6 +107,7 @@ endif()
 
 add_library(llama_jni SHARED
     llama_jni.cpp
+    ${LLAMA_VULKAN_SHIM_SOURCE}
 )
 
 target_include_directories(llama_jni PRIVATE

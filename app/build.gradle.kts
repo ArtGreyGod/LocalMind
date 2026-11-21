@@ -55,7 +55,7 @@ android {
   externalNativeBuild {
     cmake {
       path = file("src/main/cpp/CMakeLists.txt")
-      version = "3.22.1"
+      version = "3.30.3"
     }
   }
 
@@ -100,11 +100,6 @@ android {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
   }
-  kotlin {
-    compilerOptions {
-      freeCompilerArgs.add("-Xskip-metadata-version-check")
-    }
-  }
   buildFeatures {
     compose = true
     buildConfig = true
@@ -114,6 +109,12 @@ android {
     includeInApk = false
     includeInBundle = true
   }
+  // Export Room schemas for verifiable migrations (see app/schemas)
+  ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+    arg("room.incremental", "true")
+  }
+
   packaging {
     resources {
       excludes += setOf(
@@ -170,6 +171,7 @@ dependencies {
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   implementation(libs.kotlinx.serialization.json)
+  implementation(libs.androidx.biometric)
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)

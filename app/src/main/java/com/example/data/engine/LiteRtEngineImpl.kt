@@ -221,7 +221,7 @@ class LiteRtEngineImpl(
             val startNs = System.nanoTime()
             var firstTokenNs: Long? = null
             var decodeTokens = 0
-            val approxPromptTokens = max(1, (input.prompt.length / 4) + if (input.imageAttachment != null) 256 else 0)
+            val approxPromptTokens = max(1, (input.prompt.length / 4) + input.imageAttachments.size * 256)
 
             try {
                 when (config.format) {
@@ -244,11 +244,11 @@ class LiteRtEngineImpl(
                             lmConversation = createLiteRtLmConversation(eng, updatedConfig, lmHistory.toList())
                         }
                         val conv = checkNotNull(lmConversation) { "LiteRT-LM conversation missing" }
-                        val promptMessage: Message = if (input.imageAttachment != null) {
+                        val promptMessage: Message = if (input.imageAttachments.isNotEmpty()) {
                             Message.user(
                                 Contents.of(
-                                    Content.ImageBytes(input.imageAttachment.jpegBytes),
-                                    Content.Text(input.prompt)
+                                    input.imageAttachments.map { Content.ImageBytes(it.jpegBytes) } +
+                                        Content.Text(input.prompt)
                                 )
                             )
                         } else {

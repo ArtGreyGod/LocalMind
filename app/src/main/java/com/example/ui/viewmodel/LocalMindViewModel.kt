@@ -7,12 +7,16 @@ import androidx.lifecycle.viewModelScope
 import com.example.LocalMindApplication
 import com.example.data.hub.HfModelFile
 import com.example.data.hub.ModelDownloadTask
+import com.example.data.local.ChatHistoryRepository
+import com.example.data.local.ChatMessageEntity
 import com.example.data.local.ChatThreadEntity
 import com.example.data.local.IndexedDocumentEntity
 import com.example.data.local.SlashCommandItem
 import com.example.data.local.WorkspaceEntity
 import com.example.data.storage.AppThemeMode
 import com.example.data.storage.ImportProgress
+import com.example.data.storage.PersistedAppSettings
+import com.example.data.rag.RagEmbeddingProvider
 import com.example.domain.engine.EngineLifecycleState
 import com.example.domain.engine.InferenceEvent
 import com.example.domain.engine.InferenceInput
@@ -40,6 +44,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -101,6 +106,18 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
     val partialTranscript: StateFlow<String> = voiceController.partialTranscript
     val speakingMessageId: StateFlow<String?> = voiceController.speakingMessageId
 
+    val appLockEnabled: StateFlow<Boolean> = preferencesRepository.settings
+        .map { it.appLockEnabled }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    val semanticRetrievalEnabled: StateFlow<Boolean> = preferencesRepository.settings
+        .map { it.semanticRetrievalEnabled }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    val embeddingModelId: StateFlow<String?> = preferencesRepository.settings
+        .map { it.embeddingModelId }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
     private val _uiState = MutableStateFlow(LocalMindUiState())
     val uiState: StateFlow<LocalMindUiState> = _uiState.asStateFlow()
 
@@ -146,9 +163,28 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             )
 
     private var generationJob: Job? = null
+    private var summarizationJob: Job? = null
     private var lastTurnImageAttachment: PreparedImage? = null
     private var attemptedStartupAutoload = false
     private var needsEngineResync = false
+
+    // Per-thread composer drafts and staged image attachments (session-scoped)
+    private val draftsByThread = mutableMapOf<String, String>()
+    private val pendingImagesByThread = mutableMapOf<String, List<PreparedImage>>()
+
+    // Semantic-RAG embedding provider backed by the engine coordinator
+    private val ragEmbeddingProvider = object : RagEmbeddingProvider {
+        override val isAvailable: Boolean
+            get() = semanticEmbeddingReady.value
+
+        override suspend fun embed(text: String): FloatArray? =
+            engineCoordinator.embedText(text)
+    }
+
+    private val semanticEmbeddingReady = MutableStateFlow(false)
+
+    private fun engineStateFile(threadId: String): File =
+        File(File(app.filesDir, "engine_states").apply { mkdirs() }, "$threadId.bin")
 
     companion object {
         fun estimateTokenCount(messages: List<ChatMessageUi>): Int {
@@ -283,6 +319,14 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             trimBeforeTurnOrder = thread.trimBeforeTurnOrder
         )
         needsEngineResync = loadedMessages.any { !it.isOutsideContextWindow }
+        val previousThreadId = _uiState.value.activeThreadId
+        if (previousThreadId != null && previousThreadId != thread.id) {
+            // Stash the outgoing thread's composer state; restore the incoming one's.
+            val out = _uiState.value
+            if (out.attachedImages.isNotEmpty()) {
+                pendingImagesByThread[previousThreadId] = out.attachedImages
+            }
+        }
         _uiState.update { state ->
             state.copy(
                 activeThreadId = thread.id,
@@ -290,7 +334,10 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                 activeWorkspaceId = workspace?.id ?: state.activeWorkspaceId,
                 activeWorkspaceName = workspace?.name ?: state.activeWorkspaceName,
                 messages = loadedMessages,
+                pendingImage = null,
+                pendingImages = pendingImagesByThread[thread.id].orEmpty(),
                 estimatedContextTokens = estimateTokenCount(loadedMessages),
+                threadMemorySummary = thread.memorySummary,
                 tuning = if (workspace != null && workspace.systemPrompt.isNotBlank()) {
                     state.tuning.copy(systemPrompt = workspace.systemPrompt)
                 } else {
@@ -338,6 +385,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
                 }
+                reconcileEmbeddingModel(persisted)
             }
         }
     }
@@ -349,6 +397,57 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                 _uiState.update { it.copy(memoryStats = stats) }
                 delay(1500)
             }
+        }
+    }
+
+    /**
+     * Keeps the semantic-RAG embedding model in sync with the persisted setting:
+     * when enabled with a chosen embedding-capable GGUF, loads it into the engine;
+     * when disabled, releases it.
+     */
+    private suspend fun reconcileEmbeddingModel(persisted: PersistedAppSettings) {
+        val targetId = persisted.embeddingModelId.takeIf { persisted.semanticRetrievalEnabled }
+        val alreadyReady = semanticEmbeddingReady.value
+        if (targetId == null) {
+            if (alreadyReady) {
+                engineCoordinator.unloadEmbeddingModel()
+                semanticEmbeddingReady.value = false
+            }
+            return
+        }
+        if (alreadyReady && targetId == loadedEmbeddingModelId) return
+        val entry = modelRepository.models.first().firstOrNull { it.id == targetId } ?: run {
+            semanticEmbeddingReady.value = false
+            return
+        }
+        engineCoordinator.loadEmbeddingModel(entry.filePath, contextLength = 512)
+        loadedEmbeddingModelId = targetId
+        semanticEmbeddingReady.value = engineCoordinator.isEmbeddingAvailable()
+    }
+
+    private var loadedEmbeddingModelId: String? = null
+
+    fun setSemanticRetrieval(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesRepository.saveSemanticRetrieval(enabled)
+            if (!enabled) {
+                engineCoordinator.unloadEmbeddingModel()
+                loadedEmbeddingModelId = null
+                semanticEmbeddingReady.value = false
+            }
+        }
+    }
+
+    fun setEmbeddingModel(modelId: String?) {
+        viewModelScope.launch {
+            preferencesRepository.saveEmbeddingModelId(modelId)
+        }
+    }
+
+    fun loadNativeDiagnostics() {
+        viewModelScope.launch {
+            val logs = engineCoordinator.recentNativeLogs()
+            _uiState.update { it.copy(nativeDiagnostics = logs.ifBlank { "No native diagnostics recorded yet." }) }
         }
     }
 
@@ -377,6 +476,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                     activeWorkspaceName = workspace?.name ?: state.activeWorkspaceName,
                     messages = emptyList(),
                     pendingImage = null,
+                    pendingImages = emptyList(),
                     estimatedContextTokens = 0,
                     liveDecodeTokensPerSec = 0.0,
                     livePrefillTokensPerSec = 0.0,
@@ -404,7 +504,21 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             lastTurnImageAttachment = null
             engineCoordinator.resetSession()
             loadThreadIntoUi(thread)
+            // Fast path: restore the saved KV-cache state instead of re-prefilling history.
+            if (needsEngineResync) {
+                val restored = engineCoordinator.loadSessionState(engineStateFile(thread.id).absolutePath)
+                if (restored) {
+                    needsEngineResync = false
+                }
+            }
             refreshMemoryStatsNow()
+        }
+    }
+
+    /** KV state snapshots are invalidated by any change that desyncs the restored cache. */
+    private fun invalidateEngineStateForActiveThread() {
+        _uiState.value.activeThreadId?.let { threadId ->
+            runCatching { engineStateFile(threadId).delete() }
         }
     }
 
@@ -440,14 +554,45 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
     fun deleteThread(threadId: String) {
         viewModelScope.launch {
             val wasActive = _uiState.value.activeThreadId == threadId
+            // Snapshot for the undo snackbar before the row (and cascade) disappears.
+            val snapshot = chatHistoryRepository.snapshotThreadForUndo(threadId)
             chatHistoryRepository.deleteThread(threadId)
+            runCatching { engineStateFile(threadId).delete() }
             if (wasActive) {
                 val fallback = chatHistoryRepository.ensureSeededAndGetInitialThread()
                 engineCoordinator.resetSession()
                 loadThreadIntoUi(fallback)
             }
+            lastDeletedThreadSnapshot = snapshot
             _uiState.update { it.copy(statusBanner = "Thread deleted") }
         }
+    }
+
+    private var lastDeletedThreadSnapshot: ChatHistoryRepository.ThreadExport? = null
+
+    fun hasUndoableThreadDelete(): Boolean = lastDeletedThreadSnapshot != null
+
+    fun undoDeleteThread() {
+        val snapshot = lastDeletedThreadSnapshot ?: return
+        lastDeletedThreadSnapshot = null
+        viewModelScope.launch {
+            chatHistoryRepository.restoreThreadSnapshot(snapshot)
+            selectThread(snapshot.thread.id)
+            _uiState.update { it.copy(statusBanner = "Thread restored") }
+        }
+    }
+
+    fun setAppLock(enabled: Boolean) {
+        viewModelScope.launch {
+            preferencesRepository.saveAppLockEnabled(enabled)
+        }
+    }
+
+    suspend fun searchThreadMessages(query: String): List<ChatMessageEntity> =
+        chatHistoryRepository.searchMessages(query)
+
+    fun clearPendingSharedText() {
+        _uiState.update { it.copy(pendingSharedText = null) }
     }
 
     fun createWorkspace(name: String, systemPrompt: String) {
@@ -493,8 +638,10 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             val keepCount = minOf(4, activeMsgs.size - 1)
             val cutoffTurnOrder = activeMsgs[activeMsgs.size - keepCount].turnOrder
 
+            val trimmedTurns = activeMsgs.filter { it.turnOrder < cutoffTurnOrder }
             chatHistoryRepository.setTrimBeforeTurnOrder(threadId, cutoffTurnOrder)
             val reloaded = chatHistoryRepository.loadActiveBranchMessages(threadId, cutoffTurnOrder)
+            invalidateEngineStateForActiveThread()
             engineCoordinator.resetSession()
             needsEngineResync = true
 
@@ -506,6 +653,61 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                 )
             }
             refreshMemoryStatsNow()
+            summarizeTrimmedTurns(threadId, cutoffTurnOrder, trimmedTurns)
+        }
+    }
+
+    /**
+     * Conversation memory: distills newly-trimmed turns into the thread's rolling summary
+     * using the loaded model, so resynced contexts stay aware of older history. Best-effort;
+     * silently skipped when no model is loaded or a generation is already running.
+     */
+    private fun summarizeTrimmedTurns(threadId: String, untilTurnOrder: Int, trimmedTurns: List<ChatMessageUi>) {
+        if (trimmedTurns.isEmpty()) return
+        if (engineState.value !is EngineLifecycleState.Ready) return
+        summarizationJob?.cancel()
+        summarizationJob = viewModelScope.launch {
+            val previousSummary = _uiState.value.threadMemorySummary
+            val transcript = buildString {
+                if (!previousSummary.isNullOrBlank()) {
+                    appendLine("Earlier conversation summary:")
+                    appendLine(previousSummary.trim())
+                    appendLine()
+                }
+                appendLine("New turns to fold in:")
+                trimmedTurns.forEach { msg ->
+                    val who = if (msg.role == ChatRole.USER) "User" else "Assistant"
+                    appendLine("$who: ${msg.text.take(600).trim()}")
+                }
+            }
+            val prompt = buildString {
+                appendLine("Condense the following conversation history into a compact running summary (max ~180 words) preserving key facts, decisions, names, and open questions. Output only the summary.")
+                appendLine()
+                append(transcript)
+            }
+            val input = InferenceInput(
+                prompt = prompt,
+                maxTokens = 320,
+                enableThinking = false,
+                systemPrompt = _uiState.value.tuning.systemPrompt
+            )
+            val collected = StringBuilder()
+            runCatching {
+                engineCoordinator.generateStream(input).collect { event ->
+                    when (event) {
+                        is InferenceEvent.Token -> if (!event.isThought) collected.append(event.text)
+                        is InferenceEvent.Completed -> Unit
+                        is InferenceEvent.Error -> throw IllegalStateException(event.message)
+                        else -> Unit
+                    }
+                }
+            }.onSuccess {
+                val summary = collected.toString().trim()
+                if (summary.isNotBlank()) {
+                    chatHistoryRepository.setThreadMemorySummary(threadId, summary, untilTurnOrder)
+                    _uiState.update { it.copy(threadMemorySummary = summary) }
+                }
+            }
         }
     }
 
@@ -744,6 +946,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun downloadHubFile(file: HfModelFile) {
         _uiState.update { it.copy(statusBanner = "Downloading ${file.fileName}...") }
+        com.example.data.hub.DownloadForegroundService.startIfDownloadsActive(app)
         huggingFaceHubRepository.startOrResumeDownload(file) { result ->
             result.onSuccess { entry ->
                 _uiState.update {
@@ -765,6 +968,79 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
         huggingFaceHubRepository.cancelDownload(taskId)
     }
 
+    fun resumeHubDownload(taskId: String) {
+        com.example.data.hub.DownloadForegroundService.startIfDownloadsActive(app)
+        if (!huggingFaceHubRepository.resumeTask(taskId)) {
+            _uiState.update { it.copy(statusBanner = "This download needs to be restarted (stale session).") }
+        }
+    }
+
+    // --- Thread Export / Import (full fidelity) ---
+
+    fun exportThreadJson(threadId: String, uri: Uri) {
+        viewModelScope.launch {
+            runCatching {
+                val raw = chatHistoryRepository.exportThreadJson(threadId)
+                    ?: error("Thread not found")
+                app.contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(raw.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                } ?: error("Cannot open export destination")
+            }.onSuccess {
+                _uiState.update { it.copy(statusBanner = "Thread exported as JSON") }
+            }.onFailure { err ->
+                _uiState.update { it.copy(statusBanner = "Export failed: ${err.message}") }
+            }
+        }
+    }
+
+    fun importThreadJson(uri: Uri) {
+        viewModelScope.launch {
+            runCatching {
+                val raw = app.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?.toString(Charsets.UTF_8)
+                    ?: error("Cannot open imported file")
+                chatHistoryRepository.importThreadJson(raw)
+            }.onSuccess { result ->
+                result.onSuccess { thread ->
+                    selectThread(thread.id)
+                    _uiState.update { it.copy(statusBanner = "Imported thread '${thread.title}'") }
+                }.onFailure { err ->
+                    _uiState.update { it.copy(statusBanner = "Import failed: ${err.message}") }
+                }
+            }.onFailure { err ->
+                _uiState.update { it.copy(statusBanner = "Import failed: ${err.message}") }
+            }
+        }
+    }
+
+    // --- Share-sheet & Shortcut Entry Points ---
+
+    /**
+     * Handles text shared into LocalMind from other apps: if a model is ready, starts a
+     * new thread with the shared content; otherwise seeds the composer draft.
+     */
+    fun handleSharedText(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        if (engineState.value is EngineLifecycleState.Ready) {
+            createNewThread(initialPrompt = clean)
+        } else {
+            _uiState.update {
+                it.copy(
+                    statusBanner = "Load a local model to process shared content",
+                    pendingSharedText = clean
+                )
+            }
+        }
+    }
+
+    fun consumePendingSharedText(): String? {
+        val text = _uiState.value.pendingSharedText ?: return null
+        _uiState.update { it.copy(pendingSharedText = null) }
+        return text
+    }
+
     // --- Multimodal Image Attachments ---
 
     fun attachImageUri(uri: Uri) {
@@ -774,7 +1050,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             result.onSuccess { prepared ->
                 _uiState.update {
                     it.copy(
-                        pendingImage = prepared,
+                        pendingImages = (it.attachedImages + prepared).takeLast(4),
                         isPreparingImage = false
                     )
                 }
@@ -790,7 +1066,25 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun clearPendingImage() {
-        _uiState.update { it.copy(pendingImage = null) }
+        _uiState.update { it.copy(pendingImage = null, pendingImages = emptyList()) }
+    }
+
+    fun removePendingImage(uriString: String) {
+        _uiState.update { it.copy(pendingImages = it.pendingImages.filterNot { p -> p.uriString == uriString }) }
+    }
+
+    // --- Per-thread Composer Drafts ---
+
+    fun saveDraft(threadId: String?, text: String) {
+        if (threadId == null) return
+        synchronized(draftsByThread) {
+            if (text.isBlank()) draftsByThread.remove(threadId) else draftsByThread[threadId] = text
+        }
+    }
+
+    fun restoreDraft(threadId: String?): String {
+        if (threadId == null) return ""
+        return synchronized(draftsByThread) { draftsByThread[threadId].orEmpty() }
     }
 
     // --- Voice Dictation & Read-Aloud ---
@@ -815,15 +1109,15 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun sendPrompt(rawPrompt: String) {
         val promptText = rawPrompt.trim()
-        val attached = _uiState.value.pendingImage
-        if (promptText.isEmpty() && attached == null) return
+        val attached = _uiState.value.attachedImages
+        if (promptText.isEmpty() && attached.isEmpty()) return
         if (engineState.value !is EngineLifecycleState.Ready) {
             _uiState.update { it.copy(statusBanner = "Load a local model from the Vault before chatting.") }
             return
         }
 
         val effectivePrompt = promptText.ifEmpty { "Describe this image in detail." }
-        lastTurnImageAttachment = attached
+        lastTurnImageAttachment = attached.firstOrNull()
 
         viewModelScope.launch {
             val threadId = _uiState.value.activeThreadId
@@ -836,7 +1130,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                 id = userMsgId,
                 role = ChatRole.USER,
                 text = effectivePrompt,
-                imageUriString = attached?.uriString,
+                imageUris = attached.map { it.uriString },
                 turnOrder = nextTurnOrder,
                 branchGroupId = userMsgId
             )
@@ -862,7 +1156,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             launchAssistantGeneration(
                 threadId = threadId,
                 userMessage = userMsg,
-                attachedImage = attached,
+                attachedImages = attached,
                 priorMessages = priorMessages,
                 assistantTurnOrder = nextTurnOrder + 1,
                 assistantBranchGroupId = UUID.randomUUID().toString(),
@@ -885,6 +1179,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             val threadId = _uiState.value.activeThreadId ?: return@launch
             val preservedImage = resolveAttachedImage(lastUser.imageUriString)
             lastTurnImageAttachment = preservedImage
+            invalidateEngineStateForActiveThread()
             val rolledBack = engineCoordinator.rollbackLastTurn()
             if (!rolledBack) {
                 engineCoordinator.resetSession()
@@ -893,7 +1188,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             launchAssistantGeneration(
                 threadId = threadId,
                 userMessage = lastUser,
-                attachedImage = preservedImage,
+                attachedImages = listOfNotNull(preservedImage),
                 priorMessages = earlierMessages,
                 assistantTurnOrder = lastAssistant.turnOrder,
                 assistantBranchGroupId = lastAssistant.branchGroupId,
@@ -912,6 +1207,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                 threadId = threadId,
                 trimBeforeTurnOrder = thread.trimBeforeTurnOrder
             )
+            invalidateEngineStateForActiveThread()
             engineCoordinator.resetSession()
             needsEngineResync = true
             _uiState.update { state ->
@@ -939,6 +1235,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             val threadId = _uiState.value.activeThreadId ?: return@launch
             val preservedImage = resolveAttachedImage(targetUser.imageUriString)
             lastTurnImageAttachment = preservedImage
+            invalidateEngineStateForActiveThread()
             val rolledBack = engineCoordinator.rollbackLastTurn()
             if (!rolledBack) {
                 engineCoordinator.resetSession()
@@ -960,7 +1257,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             launchAssistantGeneration(
                 threadId = threadId,
                 userMessage = updatedUser,
-                attachedImage = preservedImage,
+                attachedImages = listOfNotNull(preservedImage),
                 priorMessages = earlierMessages,
                 assistantTurnOrder = updatedUser.turnOrder + 1,
                 assistantBranchGroupId = UUID.randomUUID().toString(),
@@ -981,6 +1278,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
     fun deleteMessage(messageId: String) {
         viewModelScope.launch {
             chatHistoryRepository.deleteMessage(messageId)
+            invalidateEngineStateForActiveThread()
             engineCoordinator.resetSession()
             needsEngineResync = true
             _uiState.update { state ->
@@ -996,7 +1294,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
     private fun launchAssistantGeneration(
         threadId: String,
         userMessage: ChatMessageUi,
-        attachedImage: PreparedImage?,
+        attachedImages: List<PreparedImage>,
         priorMessages: List<ChatMessageUi>,
         assistantTurnOrder: Int,
         assistantBranchGroupId: String,
@@ -1023,6 +1321,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             it.copy(
                 messages = nextList,
                 pendingImage = null,
+                pendingImages = emptyList(),
                 statusBanner = null,
                 liveDecodeTokensPerSec = 0.0,
                 livePrefillTokensPerSec = 0.0,
@@ -1049,7 +1348,8 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             val ragResult = localRagRepository.retrieveContextForPrompt(
                 query = userMessage.text,
                 attachedDocs = attachedDocuments.value,
-                topK = 3
+                topK = 3,
+                embeddingProvider = ragEmbeddingProvider
             )
             val citations = ragResult?.citations.orEmpty()
             if (citations.isNotEmpty()) {
@@ -1064,9 +1364,14 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
 
             val historyBlock = if (needsEngineResync) {
                 val activePrior = priorMessages.filterNot { it.isOutsideContextWindow }
-                if (activePrior.isNotEmpty()) {
+                val memorySummary = _uiState.value.threadMemorySummary?.takeIf { it.isNotBlank() }
+                if (activePrior.isNotEmpty() || memorySummary != null) {
                     buildString {
                         appendLine("<conversation_history>")
+                        if (memorySummary != null) {
+                            appendLine("Summary of earlier trimmed turns: $memorySummary")
+                            if (activePrior.isNotEmpty()) appendLine()
+                        }
                         activePrior.forEach { m ->
                             val who = if (m.role == ChatRole.USER) "User" else "Assistant"
                             appendLine("$who: ${m.text.trim()}")
@@ -1091,7 +1396,7 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
             val tuning = _uiState.value.tuning
             val input = InferenceInput(
                 prompt = promptForEngine,
-                imageAttachment = attachedImage,
+                imageAttachments = attachedImages,
                 maxTokens = tuning.maxTokens,
                 enableThinking = tuning.enableThinking,
                 thinkingBudgetTokens = tuning.thinkingBudgetTokens,
@@ -1250,6 +1555,15 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
                                         revisionIndex = assistantRevisionIndex,
                                         isActiveBranch = true
                                     )
+                                }
+                            }
+                            // Persist the live KV-cache so switching back to this thread
+                            // can resume without a full re-prefill (llama.cpp only).
+                            if (!needsEngineResync) {
+                                withContext(Dispatchers.IO) {
+                                    runCatching {
+                                        engineCoordinator.saveSessionState(engineStateFile(threadId).absolutePath)
+                                    }
                                 }
                             }
                             refreshMemoryStatsNow()
@@ -1473,8 +1787,6 @@ class LocalMindViewModel(application: Application) : AndroidViewModel(applicatio
         _uiState.update { it.copy(memoryStats = stats) }
     }
 
-    override fun onCleared() {
-        voiceController.release()
-        super.onCleared()
-    }
+    // VoiceController is application-scoped; releasing it here would tear down TTS for the
+    // whole process whenever a ViewModel is cleared (e.g. during navigation recreation).
 }

@@ -136,6 +136,38 @@ class InferenceEngineCoordinator(
         _activeEngine.value?.resetSession()
     }
 
+    suspend fun saveSessionState(path: String): Boolean {
+        return _activeEngine.value?.saveSessionState(path) ?: false
+    }
+
+    suspend fun loadSessionState(path: String): Boolean {
+        return _activeEngine.value?.loadSessionState(path) ?: false
+    }
+
+    suspend fun loadEmbeddingModel(modelPath: String, contextLength: Int = 512) {
+        liteRtEngine.loadEmbeddingModel(modelPath, contextLength)
+        llamaCppEngine.loadEmbeddingModel(modelPath, contextLength)
+    }
+
+    suspend fun unloadEmbeddingModel() {
+        liteRtEngine.unloadEmbeddingModel()
+        llamaCppEngine.unloadEmbeddingModel()
+    }
+
+    suspend fun isEmbeddingAvailable(): Boolean {
+        return llamaCppEngine.isEmbeddingAvailable() || liteRtEngine.isEmbeddingAvailable()
+    }
+
+    suspend fun embedText(text: String): FloatArray? {
+        return llamaCppEngine.embedText(text) ?: liteRtEngine.embedText(text)
+    }
+
+    suspend fun recentNativeLogs(): String {
+        val llamaLogs = llamaCppEngine.recentNativeLogs()
+        val liteRtLogs = liteRtEngine.recentNativeLogs()
+        return listOf(llamaLogs, liteRtLogs).filter { it.isNotBlank() }.joinToString("\n")
+    }
+
     suspend fun unloadActiveModel() {
         liteRtEngine.unloadModel()
         llamaCppEngine.unloadModel()

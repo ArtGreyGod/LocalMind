@@ -298,11 +298,15 @@ private fun MarkdownBlocksColumn(
                             3 -> MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold)
                             else -> style.copy(fontWeight = FontWeight.SemiBold)
                         }
-                        val annotated = buildInlineMarkdown(
-                            text = if (appendCursor) "${block.text} ▍" else block.text,
-                            inlineCodeBg = inlineCodeBackground,
-                            linkColor = accentColor
-                        )
+                        // Cache annotation per unchanged block text: during token streaming
+                        // every stable prefix block skips regex re-annotation entirely.
+                        val annotated = remember(block.text, appendCursor) {
+                            buildInlineMarkdown(
+                                text = if (appendCursor) "${block.text} ▍" else block.text,
+                                inlineCodeBg = inlineCodeBackground,
+                                linkColor = accentColor
+                            )
+                        }
                         Text(
                             text = annotated,
                             style = headingStyle,
@@ -311,11 +315,13 @@ private fun MarkdownBlocksColumn(
                     }
 
                     is MarkdownBlock.Paragraph -> {
-                        val annotated = buildInlineMarkdown(
-                            text = if (appendCursor) "${block.text} ▍" else block.text,
-                            inlineCodeBg = inlineCodeBackground,
-                            linkColor = accentColor
-                        )
+                        val annotated = remember(block.text, appendCursor) {
+                            buildInlineMarkdown(
+                                text = if (appendCursor) "${block.text} ▍" else block.text,
+                                inlineCodeBg = inlineCodeBackground,
+                                linkColor = accentColor
+                            )
+                        }
                         Text(
                             text = annotated,
                             style = style,
@@ -352,12 +358,15 @@ private fun MarkdownBlocksColumn(
                                 verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 val text = block.lines.joinToString("\n")
-                                Text(
-                                    text = buildInlineMarkdown(
+                                val annotated = remember(text, appendCursor) {
+                                    buildInlineMarkdown(
                                         text = if (appendCursor) "$text ▍" else text,
                                         inlineCodeBg = inlineCodeBackground,
                                         linkColor = accentColor
-                                    ),
+                                    )
+                                }
+                                Text(
+                                    text = annotated,
                                     style = style.copy(fontStyle = FontStyle.Italic),
                                     color = color.copy(alpha = 0.9f)
                                 )
@@ -378,12 +387,15 @@ private fun MarkdownBlocksColumn(
                                         style = style.copy(fontWeight = FontWeight.Bold),
                                         color = accentColor
                                     )
-                                    Text(
-                                        text = buildInlineMarkdown(
+                                    val annotated = remember(item, showCursorOnItem) {
+                                        buildInlineMarkdown(
                                             text = if (showCursorOnItem) "$item ▍" else item,
                                             inlineCodeBg = inlineCodeBackground,
                                             linkColor = accentColor
-                                        ),
+                                        )
+                                    }
+                                    Text(
+                                        text = annotated,
                                         style = style,
                                         color = color,
                                         modifier = Modifier.weight(1f)
@@ -409,12 +421,15 @@ private fun MarkdownBlocksColumn(
                                         ),
                                         color = accentColor
                                     )
-                                    Text(
-                                        text = buildInlineMarkdown(
+                                    val annotated = remember(item, showCursorOnItem) {
+                                        buildInlineMarkdown(
                                             text = if (showCursorOnItem) "$item ▍" else item,
                                             inlineCodeBg = inlineCodeBackground,
                                             linkColor = accentColor
-                                        ),
+                                        )
+                                    }
+                                    Text(
+                                        text = annotated,
                                         style = style,
                                         color = color,
                                         modifier = Modifier.weight(1f)

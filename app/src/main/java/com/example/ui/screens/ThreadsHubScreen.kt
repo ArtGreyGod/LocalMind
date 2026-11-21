@@ -10,6 +10,12 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
+import androidx.activity.compose.rememberLauncherForActivityResult
+import com.example.data.local.ChatMessageEntity
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material.icons.rounded.Share
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -120,7 +126,11 @@ fun ThreadsHubScreen(
     onDeleteWorkspace: (String) -> Unit,
     onOpenModelVault: () -> Unit,
     onBackToWorkbench: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onExportThread: (threadId: String, uri: android.net.Uri) -> Unit = { _, _ -> },
+    onImportThread: (uri: android.net.Uri) -> Unit = {},
+    onSearchMessages: suspend (query: String) -> List<ChatMessageEntity> = { emptyList() },
+    onRestoreThread: () -> Unit = {}
 ) {
     val semantic = LocalSemanticColors.current
     val reducedMotion = rememberPrefersReducedMotion()
@@ -135,11 +145,100 @@ fun ThreadsHubScreen(
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var quickPrompt by rememberSaveable { mutableStateOf("") }
 
+    // Full-text message search results (FTS4), loaded asynchronously for the current query.
+    var messageHits by remember { mutableStateOf<List<ChatMessageEntity>>(emptyList()) }
+    var pendingDeleteThread by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingDeleteWorkspace by rememberSaveable { mutableStateOf<String?>(null) }
+    var exportTargetThread by rememberSaveable { mutableStateOf<String?>(null) }
+    val exportThreadLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        val id = exportTargetThread
+        exportTargetThread = null
+        if (uri != null && id != null) onExportThread(id, uri)
+    }
+    val importThreadLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) onImportThread(uri)
+    }
+
+    LaunchedEffect(exportTargetThread) {
+        if (exportTargetThread != null) {
+            exportThreadLauncher.launch("localmind_thread_export.json")
+        }
+    }
+
+    // Message-content search is debounced and only runs while the query is long enough.
+    LaunchedEffect(searchQuery, searchOpen) {
+        if (!searchOpen || searchQuery.trim().length < 3) {
+            messageHits = emptyList()
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(350)
+        messageHits = onSearchMessages(searchQuery)
+    }
+
     var renameTarget by remember { mutableStateOf<ChatThreadEntity?>(null) }
     var renameInput by remember { mutableStateOf("") }
     var showNewWorkspaceDialog by rememberSaveable { mutableStateOf(false) }
     var workspaceNameInput by rememberSaveable { mutableStateOf("") }
     var workspacePromptInput by rememberSaveable { mutableStateOf("") }
+
+    if (pendingDeleteThread != null) {
+        AlertDialog(
+            onDismissRequest = { pendingDeleteThread = null },
+            title = { Text("Delete Thread?") },
+            text = { Text("This permanently removes the conversation, all its branches, and attached document indexes. An Undo snackbar is offered after deletion.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDeleteThread(pendingDeleteThread!!)
+                        pendingDeleteThread = null
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.testTag("confirm_delete_thread_button")
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteThread = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (pendingDeleteWorkspace != null) {
+        AlertDialog(
+            onDismissRequest = { pendingDeleteWorkspace = null },
+            title = { Text("Delete Workspace?") },
+            text = { Text("Threads in this workspace stay (moved to General), but its scoped document library is removed.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onDeleteWorkspace(pendingDeleteWorkspace!!)
+                        pendingDeleteWorkspace = null
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    )
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeleteWorkspace = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 
     if (renameTarget != null) {
         AlertDialog(
@@ -375,6 +474,49 @@ fun ThreadsHubScreen(
                             }
                         }
 
+                        if (searchOpen && messageHits.isNotEmpty()) {
+                            item(key = "message_hits_header") {
+                                Text(
+                                    text = "Matching messages (full-text)",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                                )
+                            }
+                            itemsIndexed(messageHits.take(8), key = { _, hit -> "fts_${hit.id}" }) { _, hit ->
+                                Surface(
+                                    onClick = {
+                                        onSelectThread(hit.threadId)
+                                        onBackToWorkbench()
+                                    },
+                                    color = MaterialTheme.colorScheme.surface,
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                    shape = RoundedCornerShape(14.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(
+                                            text = workspaceMap[threads.firstOrNull { it.id == hit.threadId }?.workspaceId]?.name
+                                                ?: threadTitleOf(hit.threadId, threads),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Text(
+                                            text = hit.text.take(220),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            maxLines = 3,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
                         if (filteredThreads.isEmpty()) {
                             item(key = "threads_empty") {
                                 Column(
@@ -437,9 +579,10 @@ fun ThreadsHubScreen(
                                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                                 onToggleArchiveThread(thread.id)
                                             },
+                                            onExport = { exportTargetThread = thread.id },
                                             onDelete = {
                                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                onDeleteThread(thread.id)
+                                                pendingDeleteThread = thread.id
                                             }
                                         )
                                         if (index < pinnedThreads.lastIndex || recentThreads.isNotEmpty()) {
@@ -492,9 +635,10 @@ fun ThreadsHubScreen(
                                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                                 onToggleArchiveThread(thread.id)
                                             },
+                                            onExport = { exportTargetThread = thread.id },
                                             onDelete = {
                                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                onDeleteThread(thread.id)
+                                                pendingDeleteThread = thread.id
                                             }
                                         )
                                         if (index < recentThreads.lastIndex) {
@@ -601,7 +745,7 @@ fun ThreadsHubScreen(
                                         IconButton(
                                             onClick = {
                                                 haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                onDeleteWorkspace(workspace.id)
+                                                pendingDeleteWorkspace = workspace.id
                                             },
                                             modifier = Modifier.size(40.dp)
                                         ) {
@@ -730,7 +874,16 @@ fun ThreadsHubScreen(
                         exit = if (reducedMotion) ExitTransition.None else fadeOut(tween(110))
                     ) {
                         FloatingCircleButton(
-                            onClick = { searchOpen = !searchOpen },
+                            onClick = { importThreadLauncher.launch(arrayOf("application/json")) },
+                            icon = LocalMindIcons.AddPhotoAlternate,
+                            contentDescription = "Import thread JSON backup",
+                            iconSize = 20.dp
+                        )
+                        FloatingCircleButton(
+                            onClick = {
+                                searchOpen = !searchOpen
+                                if (!searchOpen) searchQuery = ""
+                            },
                             icon = if (searchOpen) Icons.Rounded.Close else Icons.Rounded.Search,
                             contentDescription = "Search threads",
                             iconSize = 20.dp
@@ -874,6 +1027,7 @@ private fun ThreadListRow(
     onRename: () -> Unit,
     onTogglePin: () -> Unit,
     onToggleArchive: () -> Unit,
+    onExport: () -> Unit = {},
     onDelete: () -> Unit
 ) {
     val semantic = LocalSemanticColors.current
@@ -987,6 +1141,14 @@ private fun ThreadListRow(
                     }
                 )
                 DropdownMenuItem(
+                    text = { Text("Export as JSON") },
+                    leadingIcon = { Icon(Icons.Rounded.Share, contentDescription = null) },
+                    onClick = {
+                        menuExpanded = false
+                        onExport()
+                    }
+                )
+                DropdownMenuItem(
                     text = { Text("Delete") },
                     leadingIcon = { Icon(LocalMindIcons.DeleteOutline, contentDescription = null) },
                     onClick = {
@@ -998,3 +1160,7 @@ private fun ThreadListRow(
         }
     }
 }
+
+
+private fun threadTitleOf(threadId: String, threads: List<ChatThreadEntity>): String =
+    threads.firstOrNull { it.id == threadId }?.title ?: "Thread"

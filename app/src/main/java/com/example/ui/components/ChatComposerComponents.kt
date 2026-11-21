@@ -462,12 +462,12 @@ fun CitationsChipRow(
 
 @Composable
 fun PendingAttachmentCard(
-    imageUri: String?,
-    resolutionLabel: String?,
+    images: List<com.example.domain.engine.PreparedImage>,
     isPreparing: Boolean,
     visionWarning: Boolean,
     onPickVisionPrompt: (String) -> Unit,
-    onClear: () -> Unit
+    onClear: () -> Unit,
+    onRemoveImage: (String) -> Unit = {}
 ) {
     val clearInteraction = remember { MutableInteractionSource() }
     Surface(
@@ -494,14 +494,40 @@ fun PendingAttachmentCard(
                     CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
                     Text("Resizing & normalizing bitmap...", style = MaterialTheme.typography.bodySmall)
                 } else {
-                    AsyncImage(
-                        model = imageUri,
-                        contentDescription = "Attached image preview",
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        images.forEach { image ->
+                            Box {
+                                AsyncImage(
+                                    model = image.uriString,
+                                    contentDescription = "Attached image preview",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                )
+                                if (images.size > 1) {
+                                    IconButton(
+                                        onClick = { onRemoveImage(image.uriString) },
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .size(20.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Close,
+                                            contentDescription = "Remove attached image",
+                                            tint = MaterialTheme.colorScheme.onPrimary,
+                                            modifier = Modifier
+                                                .size(14.dp)
+                                                .background(
+                                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f),
+                                                    shape = CircleShape
+                                                )
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Column(modifier = Modifier.weight(1f)) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -513,8 +539,9 @@ fun PendingAttachmentCard(
                                 tint = MaterialTheme.colorScheme.secondary,
                                 modifier = Modifier.size(14.dp)
                             )
+                            val label = images.firstOrNull()?.let { "${it.width}×${it.height} RGB" } ?: "Prepared Image"
                             Text(
-                                text = resolutionLabel ?: "Prepared Image",
+                                text = if (images.size > 1) "$label ×${images.size}" else label,
                                 style = MaterialTheme.typography.labelMedium.tabular()
                             )
                         }

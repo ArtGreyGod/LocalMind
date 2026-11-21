@@ -138,7 +138,6 @@ class VoiceController(context: Context) {
             tts = TextToSpeech(appContext) { status ->
                 if (status == TextToSpeech.SUCCESS) {
                     ttsInitialized = true
-                    tts?.language = Locale.getDefault()
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {
                             _speakingMessageId.value = utteranceId
@@ -150,11 +149,16 @@ class VoiceController(context: Context) {
                             }
                         }
 
-                        @Deprecated("Deprecated in Java")
-                        override fun onError(utteranceId: String?) {
+                        override fun onError(utteranceId: String?, errorCode: Int) {
                             if (_speakingMessageId.value == utteranceId) {
                                 _speakingMessageId.value = null
+                                _voiceError.value = "Read-aloud failed (code $errorCode)"
                             }
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(utteranceId: String?) {
+                            onError(utteranceId, -1)
                         }
                     })
                     pendingSpeakPair?.let { (id, text) ->
@@ -174,8 +178,22 @@ class VoiceController(context: Context) {
     }
 
     private fun speakNow(messageId: String, cleanText: String) {
-        _speakingMessageId.value = messageId
-        tts?.speak(cleanText, TextToSpeech.QUEUE_FLUSH, null, messageId)
+        val engine = tts ?: return
+        // Verify the requested language is actually available; a silent language failure
+        // is the most common cause of speak() being rejected with no callbacks.
+        val langResult = engine.setLanguage(Locale.getDefault())
+        if (langResult == TextToSpeech.LANG_MISSING_DATA || langResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+            _voiceError.value = "Text-to-Speech has no data for ${Locale.getDefault().displayName}"
+            return
+        }
+        // Only claim the "speaking" UI state if the engine accepted the utterance;
+        // otherwise the indicator would stick forever (no onStart/onDone/onError fires).
+        val enqueueResult = engine.speak(cleanText, TextToSpeech.QUEUE_FLUSH, null, messageId)
+        if (enqueueResult == TextToSpeech.SUCCESS) {
+            _speakingMessageId.value = messageId
+        } else {
+            _voiceError.value = "Text-to-Speech engine rejected playback"
+        }
     }
 
     fun stopSpeaking() {

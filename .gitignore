@@ -16,3 +16,6 @@
 local.properties
 .env
 debug.keystore
+
+# AI Studio artifacts (kept locally, not tracked)
+/.aistudio/
